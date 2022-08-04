@@ -9,23 +9,48 @@ pub fn test() {
 }
 
 pub struct Agent {
-    id: u64,
-    age: i32,
-    position: (u32, u32),
+    pub id: u64,
+    pub age: i32,
     genome: Vec<u32>,
     brain: Brain
 }
 
 impl Agent {
-    pub fn new(genome: &Vec<u32>, amt_inners: u8, position: (u32, u32)) -> Agent {
+    pub fn new(genome: &Vec<u32>, amt_inners: u8) -> Agent {
         let mut rng = rand::thread_rng();
         Agent {
-            id: rng.gen::<u64>(),
+            id: rng.gen::<u64>().clamp(1, u64::MAX),
             age: 0,
-            position,
             genome: genome.clone(),
             brain: Brain::from(genome.clone(), amt_inners)
         }
+    }
+
+    pub fn produce_child(&mut self, mutation_rate: f32) -> Agent {
+        let mut rng = rand::thread_rng();
+        let genome = self.mutate_genome(mutation_rate);
+
+        Agent {
+            id: rng.gen::<u64>(),
+            age: 0,
+            genome: genome.clone(),
+            brain: Brain::from(genome, self.brain.neurons[1].len() as u8)
+        }
+    }
+
+    fn mutate_genome(&mut self, mutation_rate: f32) -> Vec<u32> {
+        let mut rng = rand::thread_rng();
+        let mut out: Vec<u32> = self.genome.clone();
+
+        for i in 0..out.len() {
+            for j in 0..31 {
+                if rng.gen_range(0..(1.0/mutation_rate) as i32) == 0 {
+                    out[i] = binary_util::flip(&out[i], j)
+                }
+            }
+        }
+
+        out
     }
 }
 

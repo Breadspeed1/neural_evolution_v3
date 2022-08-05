@@ -29,10 +29,9 @@ impl Clone for Agent {
 }
 
 impl Agent {
-    pub fn new(genome: &Vec<u32>, amt_inners: u8) -> Agent {
-        let mut rng = rand::thread_rng();
+    pub fn new(genome: &Vec<u32>, amt_inners: u8, id: u64) -> Agent {
         Agent {
-            id: rng.gen::<u64>().clamp(1, u64::MAX),
+            id,
             genome: genome.clone(),
             brain: Brain::from(genome.clone(), amt_inners)
         }
@@ -42,12 +41,12 @@ impl Agent {
         self.brain.step(input)
     }
 
-    pub fn produce_child(&mut self, mutation_rate: f32) -> Agent {
+    pub fn produce_child(&mut self, mutation_rate: f32, id: u64) -> Agent {
         let mut rng = rand::thread_rng();
         let genome = self.mutate_genome(mutation_rate);
 
         Agent {
-            id: rng.gen::<u64>(),
+            id,
             genome: genome.clone(),
             brain: Brain::from(genome, self.brain.neurons[1].len() as u8)
         }

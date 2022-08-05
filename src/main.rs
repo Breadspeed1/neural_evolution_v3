@@ -99,11 +99,13 @@ impl Simulator {
         let mut ids: Vec<u64> = Vec::new();
         let mut rand = rand::thread_rng();
 
+        let mut i: u64 = 0;
         self.agents.iter().for_each(|x| {ids.push(x.id)});
         while new_generation.len() != self.population as usize {
             let mut a: Agent = self.agents.take(&ids[rand.gen_range(0..ids.len())]).unwrap();
-            new_generation.insert(a.produce_child(self.mutation_rate));
+            new_generation.insert(a.produce_child(self.mutation_rate, i));
             self.add_agent(a);
+            i += 1;
         }
 
         self.agents = new_generation;
@@ -187,7 +189,7 @@ impl Simulator {
 
                     self.add_state((id, (i as u32, j as u32)));
 
-                    if self.pos_free(pos) {
+                    if self.pos_free(pos) && !requested_moves.contains(&(id, pos)) {
                         requested_moves.push((
                             id,
                             pos
@@ -302,9 +304,10 @@ impl Simulator {
                 genome.push(rng.gen::<u32>());
             }
 
-            let mut agent: Agent = Agent::new(
+            let agent: Agent = Agent::new(
                 &genome,
-                self.amount_inners as u8
+                self.amount_inners as u8,
+                i as u64
             );
 
             self.world[pos.0 as usize][pos.1 as usize] = agent.id;

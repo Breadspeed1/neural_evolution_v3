@@ -177,7 +177,8 @@ impl Simulator {
         }
 
         let inputs = self.calc_step_inputs();
-        let mut requested_moves: Vec<(u64, (i32, i32))> = Vec::new();
+        let mut requested_moves: Vec<(i32, i32)> = Vec::new();
+        let mut requested_move_ids: Vec<u64> = Vec::new();
 
         for i in 0..self.world_size.0 {
             for j in 0..self.world_size.1 {
@@ -189,30 +190,27 @@ impl Simulator {
 
                     self.add_state((id, (i as u32, j as u32)));
 
-                    if self.pos_free(pos) && !requested_moves.contains(&(id, pos)) {
-                        requested_moves.push((
-                            id,
-                            pos
-                        ));
+                    if self.pos_free(pos) && !requested_moves.contains(&pos) {
+                        requested_moves.push(pos);
+                        requested_move_ids.push(id);
                     }
                     else {
-                        requested_moves.push((
-                            id,
-                            (i as i32, j as i32)
-                        ));
+                        requested_moves.push((i as i32, j as i32));
+                        requested_move_ids.push(id)
                     }
 
                     self.add_agent(a);
-
-                    self.world[i as usize][j as usize] = 0;
                 }
             }
         }
 
+        self.clear_world();
+
         self.states.states.push(Vec::new());
 
-        for pos in requested_moves {
-            self.world[pos.1.0 as usize][pos.1.1 as usize] = pos.0;
+        print!(" {}", requested_moves.len());
+        for i in 0..requested_moves.len() {
+            self.world[requested_moves[i].0 as usize][requested_moves[i].1 as usize] = requested_move_ids[i];
         }
 
         self.current_steps += 1;

@@ -2,6 +2,7 @@ use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
 use libm::tanh;
 use rand::Rng;
+use serde::{Serialize};
 
 mod binary_util;
 
@@ -10,10 +11,21 @@ pub fn test() {
     println!("{}", binary_util::get_segment(&rand.gen::<u32>(), 16..31))
 }
 
+#[derive(Serialize)]
 pub struct Agent {
     pub id: u64,
-    genome: Vec<u32>,
+    pub genome: Vec<u32>,
     brain: Brain
+}
+
+impl Clone for Agent {
+    fn clone(&self) -> Self {
+        Agent {
+            id: self.id,
+            genome: self.genome.clone(),
+            brain: self.brain.clone()
+        }
+    }
 }
 
 impl Agent {
@@ -26,16 +38,8 @@ impl Agent {
         }
     }
 
-    pub fn step(&mut self, input: Vec<f32>) {
-        self.brain.step(input);
-
-        println!();
-        for i in 0..self.brain.neurons.len() {
-            println!();
-            for j in 0..self.brain.neurons[i].len() {
-                print!("[{}], ", self.brain.neurons[i][j]);
-            }
-        }
+    pub fn step(&mut self, input: Vec<f32>) -> (i32, i32) {
+        self.brain.step(input)
     }
 
     pub fn produce_child(&mut self, mutation_rate: f32) -> Agent {
@@ -85,12 +89,25 @@ impl Hash for Agent {
     }
 }
 
+#[derive(Serialize)]
 struct Brain {
     genome: Vec<u32>,
     move_activation: f32,
     used_input_ids: Vec<u8>,
     connections: Vec<Connection>,
     neurons: Vec<Vec<f32>>
+}
+
+impl Clone for Brain {
+    fn clone(&self) -> Self {
+        Brain {
+            genome: self.genome.clone(),
+            move_activation: self.move_activation,
+            used_input_ids: self.used_input_ids.clone(),
+            connections: self.connections.clone(),
+            neurons: self.neurons.clone()
+        }
+    }
 }
 
 impl Brain {
@@ -116,7 +133,28 @@ impl Brain {
         self.reset_all();
         self.neurons[0] = input;
         self.calculate_all();
-        (0, 0)
+
+        let mut request = (0, 0);
+
+        if self.neurons[2][0] > self.move_activation {
+            let mut rand = rand::thread_rng();
+            request = (request.0 + rand.gen_range(-1..1), request.1 + rand.gen_range(-1..1));
+        }
+
+        let move_vec: Vec<(i32, i32)> = vec![
+            (0, 1),
+            (0, -1),
+            (1, 0),
+            (-1, 0)
+        ];
+
+        for i in 1..self.neurons[2].len() {
+            if self.neurons[2][i] > self.move_activation {
+                request = (request.0 + move_vec[i - 1].0, request.1 + move_vec[i - 1].1);
+            }
+        }
+
+        request.clamp((-1, -1), (1, 1))
     }
 
     fn reset_all(&mut self) {
@@ -177,10 +215,23 @@ impl Brain {
     }
 }
 
+#[derive(Serialize)]
 struct Connection {
     source_type: u8,
     source_id: u8,
     sink_type: u8,
     sink_id: u8,
     weight: f32
+}
+
+impl Clone for Connection {
+    fn clone(&self) -> Self {
+        Connection {
+            source_type: self.source_type,
+            source_id: self.source_id,
+            sink_type: self.sink_type,
+            sink_id: self.sink_id,
+            weight: self.weight
+        }
+    }
 }

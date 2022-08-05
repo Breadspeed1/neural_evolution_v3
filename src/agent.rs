@@ -1,16 +1,17 @@
 use std::borrow::Borrow;
 use std::hash::{Hash, Hasher};
+use libm::tanh;
 use rand::Rng;
 
 mod binary_util;
 
 pub fn test() {
-
+    let mut rand = rand::thread_rng();
+    println!("{}", binary_util::get_segment(&rand.gen::<u32>(), 16..31))
 }
 
 pub struct Agent {
     pub id: u64,
-    pub age: i32,
     genome: Vec<u32>,
     brain: Brain
 }
@@ -20,9 +21,20 @@ impl Agent {
         let mut rng = rand::thread_rng();
         Agent {
             id: rng.gen::<u64>().clamp(1, u64::MAX),
-            age: 0,
             genome: genome.clone(),
             brain: Brain::from(genome.clone(), amt_inners)
+        }
+    }
+
+    pub fn step(&mut self, input: Vec<f32>) {
+        self.brain.step(input);
+
+        println!();
+        for i in 0..self.brain.neurons.len() {
+            println!();
+            for j in 0..self.brain.neurons[i].len() {
+                print!("[{}], ", self.brain.neurons[i][j]);
+            }
         }
     }
 
@@ -32,7 +44,6 @@ impl Agent {
 
         Agent {
             id: rng.gen::<u64>(),
-            age: 0,
             genome: genome.clone(),
             brain: Brain::from(genome, self.brain.neurons[1].len() as u8)
         }
@@ -102,14 +113,14 @@ impl Brain {
     }
 
     fn step(&mut self, input: Vec<f32>) -> (i32, i32) {
-        self.neurons[0] = input;
         self.reset_all();
+        self.neurons[0] = input;
         self.calculate_all();
         (0, 0)
     }
 
     fn reset_all(&mut self) {
-        for i in 0..self.neurons.len() {
+        for i in 1..self.neurons.len() {
             for j in 0..self.neurons[i].len() {
                 self.neurons[i][j] = 0.0;
             }
@@ -119,6 +130,10 @@ impl Brain {
     fn calculate_all(&mut self) {
         for i in 0..self.connections.len() {
             self.calculate(i);
+        }
+
+        for i in 0..self.neurons[2].len() {
+            self.neurons[2][i] = tanh(self.neurons[2][i] as f64) as f32
         }
     }
 
@@ -145,7 +160,12 @@ impl Brain {
         let source_id: u8 = binary_util::get_segment(&dec, (1..7)) as u8 % self.neurons[source_type as usize].len() as u8;
         let sink_type: u8 = binary_util::get_segment(&dec, (8..8)) as u8 + 1;
         let sink_id: u8 = binary_util::get_segment(&dec, (9..15)) as u8 % self.neurons[sink_type as usize].len() as u8;
-        let weight: f32 = binary_util::get_segment(&dec, (16..31)) as f32 / 8000.0;
+        let mut weight: f32 = 0.0;
+
+        if binary_util::get_segment(&dec, 16..16) == 1 {
+            weight = binary_util::get_segment(&dec, (17..31)) as f32 / 8000.0;
+        }
+        weight = binary_util::get_segment(&dec, (17..31)) as f32 / -8000.0;
 
         self.connections.push(Connection{
             source_type,

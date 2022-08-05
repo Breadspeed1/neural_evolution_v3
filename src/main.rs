@@ -11,7 +11,7 @@ fn main() {
     let amount_inners: u32 = 20;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
-    let population: u32 = 200;
+    let population: u32 = 1000;
     let world_size: (u16, u16) = (128, 128);
 
     let mut simulator = Simulator::new(
@@ -46,23 +46,7 @@ struct Simulator {
     steps_per_generation: u32,
     population: u32,
     world_size: (u16, u16),
-    move_vectors: Vec<(i8, i8)>,
-    states: Generation
-}
-
-#[derive(Serialize)]
-struct Generation {
-    states: Vec<Vec<(u64, (u32, u32))>>,
-    agents: Vec<(u64, Vec<u32>)>,
-}
-
-impl Generation {
-    fn new() -> Generation {
-        Generation {
-            states: Vec::new(),
-            agents: Vec::new(),
-        }
-    }
+    move_vectors: Vec<(i8, i8)>
 }
 
 impl Simulator {
@@ -87,8 +71,7 @@ impl Simulator {
             (-1, 0),
             (-1, 1),
             (-1, -1)
-            ],
-            states: Generation::new()
+            ]
         }
     }
 
@@ -110,8 +93,6 @@ impl Simulator {
 
         self.agents = new_generation;
         self.populate_world();
-
-        self.generation_to_json();
         self.reset_generation();
 
         println!("on generation {}", self.generation);
@@ -120,17 +101,12 @@ impl Simulator {
     fn reset_generation(&mut self) {
         let mut new_agents: Vec<(u64, Vec<u32>)> = Vec::new();
         self.agents.iter().for_each(|x| new_agents.push((x.id, x.genome.clone())));
-
-        self.states = Generation {
-            states: Vec::new(),
-            agents: new_agents
-        };
     }
 
-    fn generation_to_json(&mut self) {
+    /*fn generation_to_json(&mut self) {
         let j = serde_json::to_string(&self.states);
-        fs::write(format!("output\\{}.json", self.generation), j.unwrap().to_string()).expect("error writing file");
-    }
+        fs::write(format!("G:\\\\output\\{}.json", self.generation - 1), j.unwrap().to_string()).expect("error writing file");
+    }*/
 
     fn populate_world(&mut self) {
         let mut taken_pos: HashSet<(u32, u32)> = HashSet::new();
@@ -188,8 +164,6 @@ impl Simulator {
                     let translation: (i32, i32) = a.step(self.calc_positional_inputs((i as i32, j as i32), inputs.clone()));
                     let pos: (i32, i32) = (translation.0 + i as i32, translation.1 + j as i32);
 
-                    self.add_state((id, (i as u32, j as u32)));
-
                     if self.pos_free(pos) && !requested_moves.contains(&pos) {
                         requested_moves.push(pos);
                         requested_move_ids.push(id);
@@ -206,9 +180,6 @@ impl Simulator {
 
         self.clear_world();
 
-        self.states.states.push(Vec::new());
-
-        print!(" {}", requested_moves.len());
         for i in 0..requested_moves.len() {
             self.world[requested_moves[i].0 as usize][requested_moves[i].1 as usize] = requested_move_ids[i];
         }
@@ -216,7 +187,7 @@ impl Simulator {
         self.current_steps += 1;
     }
 
-    fn add_state(&mut self, s: (u64, (u32, u32))) {
+    /*fn add_state(&mut self, s: (u64, (u32, u32))) {
         let l = self.state_len();
         if l > 0 {
             self.states.states[l - 1].push(s);
@@ -224,11 +195,11 @@ impl Simulator {
         else {
             self.states.states.push(vec![s])
         }
-    }
+    }*/
 
-    fn state_len(&mut self) -> usize {
+    /*fn state_len(&mut self) -> usize {
         self.states.states.len()
-    }
+    }*/
 
     fn add_agent(&mut self, agent: Agent) {
         self.agents.insert(agent);

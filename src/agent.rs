@@ -56,6 +56,19 @@ impl Agent {
         }
     }
 
+    pub fn get_rgba(&mut self) -> [u8; 4] {
+        let mut av: u128 = 0;
+        self.genome.iter().for_each(|x| av += *x as u128);
+        av /= self.genome.len() as u128;
+
+        [
+            binary_util::get_segment(&(av as u32), 0..=7) as u8,
+            binary_util::get_segment(&(av as u32), 8..=15) as u8,
+            binary_util::get_segment(&(av as u32), 16..=23) as u8,
+            binary_util::get_segment(&(av as u32), 24..=31) as u8
+        ]
+    }
+
     fn mutate_genome(&mut self, mutation_rate: f32) -> Vec<u32> {
         let mut rng = rand::thread_rng();
         let mut out: Vec<u32> = self.genome.clone();
@@ -187,29 +200,6 @@ impl Brain {
 
         self.connections.sort_by(|a, b| a.sink_id.cmp(&b.sink_id));
     }
-
-    /*fn filter_connections(&mut self) {
-        let mut to_outer: Vec<Connection> = Vec::new();
-        let mut to_inner: Vec<Connection> = Vec::new();
-
-        for i in 0..self.connections.len() {
-            let connection: Connection = self.connections[i].clone();
-            if self.connections[i].sink_type == 2 {
-                to_outer.push(connection);
-            }
-            else {
-                to_inner.push(connection);
-            }
-        }
-
-        for i in 0..to_inner.len() {
-            if to_outer.iter().any(|x| x.source_id == to_inner[i].sink_id) {
-                to_outer.push(to_inner[i].clone());
-            }
-        }
-
-        self.connections = to_outer;
-    }*/
 
     fn generate_connection_from_genome_segment(&mut self, index: usize) {
         let dec: u32 = self.genome[index];

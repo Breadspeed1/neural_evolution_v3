@@ -1,13 +1,15 @@
 use std::fs::File;
 use std::time::Instant;
-use image::{Frame, ImageBuffer, RgbaImage};
+use image::{EncodableLayout, Frame, ImageBuffer, Rgba, RgbaImage};
 use image::codecs::gif::{GifEncoder};
 use rand::{Rng};
+use show_image::{create_window, Image, ImageInfo, ImageView, WindowProxy};
 use crate::agent::Agent;
 
 mod agent;
 
-fn main() {
+#[show_image::main]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let genome_length: u32 = 32;
     let amount_inners: u32 = 20;
     let mutation_rate: f32 = 0.001;
@@ -29,11 +31,13 @@ fn main() {
     );
 
     run_sim(&mut simulator);
+
+    Ok(())
 }
 
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
-    let generations = 60;
+    let generations = 500;
 
     let now = Instant::now();
     while simulator.generation < generations {
@@ -95,7 +99,8 @@ struct Simulator {
     move_vectors: Vec<(i32, i32)>,
     output: GenerationOutput,
     obstacles: Vec<((u32, u32), (u32, u32))>,
-    use_output: bool
+    use_output: bool,
+    window: WindowProxy
 }
 
 impl Simulator {
@@ -122,7 +127,8 @@ impl Simulator {
             ],
             output: GenerationOutput::new(),
             obstacles,
-            use_output
+            use_output,
+            window: create_window("g", Default::default()).unwrap()
         }
     }
 
@@ -202,6 +208,9 @@ impl Simulator {
             return;
         }
 
+        let mut image: RgbaImage = ImageBuffer::new(128, 128);
+        image.fill(u8::MAX);
+
         let inputs = self.calc_step_inputs();
 
         for i in 0..self.agents.len() {
@@ -216,12 +225,18 @@ impl Simulator {
                 self.agents[i].set_pos(pos);
                 self.toggle_pos(pos);
             }
+
+            let mut pix = image.get_pixel_mut(pos.0, pos.1);
+            pix.0 = self.agents[i].get_rgba();
         }
+
+        self.current_steps += 1;
+
+        self.window.set_image("generation x", ImageView::new(ImageInfo::rgba8(128, 128), image.as_bytes())).unwrap();
 
         if self.use_output {
             self.update_output();
         }
-        self.current_steps += 1;
     }
 
 

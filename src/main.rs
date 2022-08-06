@@ -34,8 +34,6 @@ fn main() {
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
     let generations = 60;
-    let est_mins = ((generations as f32 * 0.4014)/60.0) * 1.5;
-    println!("estimated time: {} minutes ({} hours)", est_mins, est_mins/60.0);
 
     let now = Instant::now();
     while simulator.generation < generations {

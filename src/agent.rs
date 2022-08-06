@@ -38,7 +38,7 @@ impl Agent {
         self.pos
     }
 
-    pub fn get_used_inputs(&mut self) -> Vec<usize> {
+    pub fn get_used_inputs(&self) -> Vec<usize> {
         self.brain.get_used_inputs()
     }
 
@@ -148,7 +148,7 @@ impl Brain {
         request.clamp((-1, -1), (1, 1))
     }
 
-    fn get_used_inputs(&mut self) -> Vec<usize> {
+    fn get_used_inputs(&self) -> Vec<usize> {
         self.used_input_ids.clone()
     }
 

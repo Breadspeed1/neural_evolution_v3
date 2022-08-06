@@ -5,8 +5,8 @@ use crate::agent::Agent;
 mod agent;
 
 fn main() {
-    let genome_length: u32 = 32;
-    let amount_inners: u32 = 20;
+    let genome_length: u32 = 2;
+    let amount_inners: u32 = 1;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
@@ -26,10 +26,11 @@ fn main() {
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
 
-    loop {
+    let now = Instant::now();
+    while simulator.generation <= 60 {
         simulator.step();
     }
-
+    println!("60 gens took {} seconds", now.elapsed().as_secs_f32());
 }
 
 struct Simulator {
@@ -71,8 +72,6 @@ impl Simulator {
     }
 
     fn spawn_next_generation(&mut self) {
-        let now = Instant::now();
-
         self.generation += 1;
         self.remove_losers();
         let mut new_generation: Vec<Agent> = Vec::new();
@@ -88,7 +87,6 @@ impl Simulator {
         self.agents = new_generation;
 
         println!("on generation {}", self.generation);
-        println!("generation took {}ms to generate", now.elapsed().as_millis());
     }
 
     fn rand_pos(&mut self) -> (u32, u32) {

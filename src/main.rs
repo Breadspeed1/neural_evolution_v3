@@ -23,7 +23,6 @@ fn main() {
         false
     );
 
-    //agent::test();
     run_sim(&mut simulator);
 }
 

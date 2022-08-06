@@ -8,7 +8,9 @@ mod binary_util;
 pub struct Agent {
     pub genome: Vec<u32>,
     pub pos: (u32, u32),
-    brain: Brain
+    brain: Brain,
+    rgba: [u8; 4],
+    amt_inners: u8
 }
 
 impl Clone for Agent {
@@ -16,7 +18,9 @@ impl Clone for Agent {
         Agent {
             pos: self.pos,
             genome: self.genome.clone(),
-            brain: self.brain.clone()
+            brain: self.brain.clone(),
+            rgba: self.get_rgba(),
+            amt_inners: self.amt_inners
         }
     }
 }
@@ -26,7 +30,9 @@ impl Agent {
         Agent {
             pos,
             genome: genome.clone(),
-            brain: Brain::from(genome.clone(), amt_inners)
+            brain: Brain::from(genome.clone(), amt_inners),
+            rgba: Agent::calc_rgba(genome),
+            amt_inners
         }
     }
 
@@ -48,24 +54,27 @@ impl Agent {
 
     pub fn produce_child(&mut self, mutation_rate: f32, pos: (u32, u32)) -> Agent {
         let genome = self.mutate_genome(mutation_rate);
-
-        Agent {
-            pos,
-            genome: genome.clone(),
-            brain: Brain::from(genome, self.brain.neurons[1].len() as u8)
-        }
+        Agent::new(
+            &genome,
+            self.amt_inners,
+            pos
+        )
     }
 
-    pub fn get_rgba(&mut self) -> [u8; 4] {
+    pub fn get_rgba(&self) -> [u8; 4] {
+        self.rgba
+    }
+
+    pub fn calc_rgba(genome: &Vec<u32>) -> [u8; 4] {
         let mut av: u128 = 0;
-        self.genome.iter().for_each(|x| av += *x as u128);
-        av /= self.genome.len() as u128;
+        genome.iter().for_each(|x| av += *x as u128);
+        av /= genome.len() as u128;
 
         [
             binary_util::get_segment(&(av as u32), 0..=7) as u8,
             binary_util::get_segment(&(av as u32), 8..=15) as u8,
             binary_util::get_segment(&(av as u32), 16..=23) as u8,
-            binary_util::get_segment(&(av as u32), 24..=31) as u8
+            255
         ]
     }
 

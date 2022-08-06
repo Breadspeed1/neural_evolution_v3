@@ -15,14 +15,14 @@ mod agent;
 
 #[show_image::main]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let genome_length: u32 = 32;
-    let amount_inners: u32 = 20;
+    let genome_length: u32 = 256;
+    let amount_inners: u32 = 225;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 300;
     let population: u32 = 1000;
     let generate_gifs: bool = false;
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
-        ((20, 84), (108, 84))
+        ((10, 108), (118, 108))
     ];
 
     let mut simulator = Simulator::new(

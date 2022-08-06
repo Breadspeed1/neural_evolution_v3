@@ -8,12 +8,15 @@ use crate::agent::Agent;
 mod agent;
 
 fn main() {
-    let genome_length: u32 = 32;
-    let amount_inners: u32 = 24;
+    let genome_length: u32 = 128;
+    let amount_inners: u32 = 100;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
     let generate_gifs: bool = true;
+    let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
+        ((20, 64), (108, 64))
+    ];
 
     let mut simulator = Simulator::new(
         genome_length,
@@ -21,6 +24,7 @@ fn main() {
         mutation_rate,
         steps_per_generation,
         population,
+        obstacles,
         generate_gifs
     );
 
@@ -29,7 +33,7 @@ fn main() {
 
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
-    let generations = 60;
+    let generations = 2000;
 
     let now = Instant::now();
     while simulator.generation < generations {
@@ -90,11 +94,12 @@ struct Simulator {
     population: u32,
     move_vectors: Vec<(i32, i32)>,
     output: GenerationOutput,
+    obstacles: Vec<((u32, u32), (u32, u32))>,
     use_output: bool
 }
 
 impl Simulator {
-    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, use_output: bool) -> Simulator {
+    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool) -> Simulator {
         Simulator {
             world: vec![0; 128],
             agents: Vec::new(),
@@ -116,6 +121,7 @@ impl Simulator {
             (-1, -1)
             ],
             output: GenerationOutput::new(),
+            obstacles,
             use_output
         }
     }
@@ -186,6 +192,7 @@ impl Simulator {
 
     fn clear_world(&mut self) {
         self.world = vec![0; 128];
+        self.add_obstacles();
     }
 
     fn step(&mut self) {
@@ -275,6 +282,18 @@ impl Simulator {
         genome
     }
 
+    fn add_obstacles(&mut self) {
+        for obstacle in &mut *self.obstacles {
+            let mut mask = 0;
+            (obstacle.0.1..=obstacle.1.1).for_each(|x| mask += (2 as u128).pow(x));
+
+            for x in obstacle.0.0..=obstacle.1.0 {
+                self.world[x as usize] |= mask;
+                //println!("{}", self.world[x as usize]);
+            }
+        }
+    }
+
     fn generate_initial_generation(&mut self) {
         for _ in 0..self.population {
             let pos: (u32, u32) = self.rand_pos();
@@ -285,5 +304,7 @@ impl Simulator {
                 pos
             ));
         }
+
+        self.add_obstacles();
     }
 }

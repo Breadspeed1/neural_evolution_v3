@@ -1,12 +1,15 @@
+use std::fs::File;
 use std::time::Instant;
+use image::{Frame, ImageBuffer, RgbaImage};
+use image::codecs::gif::{GifEncoder};
 use rand::{Rng};
 use crate::agent::Agent;
 
 mod agent;
 
 fn main() {
-    let genome_length: u32 = 2;
-    let amount_inners: u32 = 1;
+    let genome_length: u32 = 32;
+    let amount_inners: u32 = 24;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
@@ -16,7 +19,8 @@ fn main() {
         amount_inners,
         mutation_rate,
         steps_per_generation,
-        population
+        population,
+        false
     );
 
     //agent::test();
@@ -27,10 +31,50 @@ fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
 
     let now = Instant::now();
-    while simulator.generation <= 60 {
+    while simulator.generation < 60 {
         simulator.step();
+        if simulator.current_steps == 0 {
+            println!("on generation {}", simulator.generation);
+        }
     }
     println!("60 gens took {} seconds", now.elapsed().as_secs_f32());
+}
+
+struct GenerationOutput {
+    frames: Vec<Frame>
+}
+
+impl GenerationOutput {
+    fn new() -> GenerationOutput {
+        GenerationOutput {
+            frames: Vec::new()
+        }
+    }
+
+    fn add_step(&mut self, state: Vec<u128>) {
+        let mut im: RgbaImage = ImageBuffer::new(128, 128);
+        im.fill(u8::MAX);
+
+        for i in 0..state.len() {
+            for j in 0..128 as u32 {
+                let mask = (2 as u128).pow(j);
+                if (state[i] & mask)/mask == 1 {
+                    im.get_pixel_mut(i as u32, j).0 = [255, 0, 0, 255];
+                }
+            }
+        }
+
+        self.frames.push(Frame::new(im));
+    }
+
+    fn save(&mut self, path: String) {
+        let file_out = File::create(path).unwrap();
+        let mut encoder = GifEncoder::new(file_out);
+
+        for i in 0..self.frames.len() {
+            encoder.encode_frame(self.frames[i].clone()).unwrap();
+        }
+    }
 }
 
 struct Simulator {
@@ -43,11 +87,13 @@ struct Simulator {
     mutation_rate: f32,
     steps_per_generation: u32,
     population: u32,
-    move_vectors: Vec<(i32, i32)>
+    move_vectors: Vec<(i32, i32)>,
+    output: GenerationOutput,
+    use_output: bool
 }
 
 impl Simulator {
-    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32) -> Simulator {
+    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, use_output: bool) -> Simulator {
         Simulator {
             world: vec![0; 128],
             agents: Vec::new(),
@@ -67,11 +113,17 @@ impl Simulator {
             (-1, 0),
             (-1, 1),
             (-1, -1)
-            ]
+            ],
+            output: GenerationOutput::new(),
+            use_output
         }
     }
 
     fn spawn_next_generation(&mut self) {
+        if self.use_output {
+            self.reset_output()
+        }
+
         self.generation += 1;
         self.remove_losers();
         let mut new_generation: Vec<Agent> = Vec::new();
@@ -85,8 +137,6 @@ impl Simulator {
         }
 
         self.agents = new_generation;
-
-        println!("on generation {}", self.generation);
     }
 
     fn rand_pos(&mut self) -> (u32, u32) {
@@ -98,6 +148,15 @@ impl Simulator {
         self.toggle_pos(pos);
 
         pos
+    }
+
+    fn update_output(&mut self) {
+        self.output.add_step(self.world.clone());
+    }
+
+    fn reset_output(&mut self) {
+        self.output.save(format!("G:\\\\Visualizer_Output\\generation-{}.gif", self.generation));
+        self.output = GenerationOutput::new();
     }
 
     fn toggle_pos(&mut self, coords: (u32, u32)) {
@@ -137,36 +196,39 @@ impl Simulator {
 
         let inputs = self.calc_step_inputs();
 
-        let mut k = 0;
         for i in 0..self.agents.len() {
-            let agent: Agent = self.agents[i].clone();
-            let all_inputs = self.calc_positional_inputs(agent.get_pos(), &inputs);
+            let agent_pos: (u32, u32) = self.agents[i].get_pos();
+            let used: Vec<usize> = self.agents[i].get_used_inputs();
+            let all_inputs = self.calc_positional_inputs(agent_pos, &inputs, used);
             let translation: (i32, i32) = self.agents[i].step(all_inputs);
-            let pos: (u32, u32) = ((agent.pos.0 as i32 + translation.0).clamp(0, 127) as u32, (agent.pos.1 as i32 + translation.1).clamp(0, 127) as u32);
+            let pos: (u32, u32) = ((agent_pos.0 as i32 + translation.0).clamp(0, 127) as u32, (agent_pos.1 as i32 + translation.1).clamp(0, 127) as u32);
 
             if !self.get_pos(pos) {
-                self.toggle_pos(agent.get_pos());
+                self.toggle_pos(agent_pos);
                 self.agents[i].set_pos(pos);
                 self.toggle_pos(pos);
             }
-            k += 1;
         }
 
+        if self.use_output {
+            self.update_output();
+        }
         self.current_steps += 1;
     }
 
 
-    fn calc_positional_inputs(&mut self, pos: (u32, u32), base: &Vec<f32>) -> Vec<f32> {
+    fn calc_positional_inputs(&mut self, pos: (u32, u32), base: &Vec<f32>, used: Vec<usize>) -> Vec<f32> {
         let mut copy = base.clone();
+        copy.append(&mut vec![0.0; 8]);
 
-        for i in 0..self.move_vectors.len() {
-            let vec: (i32, i32) = self.move_vectors[i];
+        for i in used {
+            let vec: (i32, i32) = self.move_vectors[i - 5];
             let mut out: f32 = 1.0;
             if self.get_pos(((pos.0 as i32 + vec.0).clamp(0, 127) as u32, (pos.1 as i32 + vec.1).clamp(0, 127) as u32)) {
                 out = 0.0;
             }
 
-           copy.push(out);
+           copy[i] = out;
         }
 
         copy
@@ -186,7 +248,7 @@ impl Simulator {
         inputs[0] = 0.0;
         inputs[1] = 1.0;
         inputs[2] = (self.current_steps % 2) as f32;
-        inputs[3] = (self.current_steps as f32/self.steps_per_generation as f32);
+        inputs[3] = self.current_steps as f32/self.steps_per_generation as f32;
         inputs[4] = rand::thread_rng().gen_range(0.0..1.0);
 
         inputs

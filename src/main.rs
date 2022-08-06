@@ -26,11 +26,10 @@ fn main() {
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
 
-    let now = Instant::now();
-    while simulator.generation < 60 {
+    loop {
         simulator.step();
     }
-    println!("60 generations took {} seconds", now.elapsed().as_secs_f32());
+
 }
 
 struct Simulator {
@@ -72,6 +71,8 @@ impl Simulator {
     }
 
     fn spawn_next_generation(&mut self) {
+        let now = Instant::now();
+
         self.generation += 1;
         self.remove_losers();
         let mut new_generation: Vec<Agent> = Vec::new();
@@ -87,6 +88,7 @@ impl Simulator {
         self.agents = new_generation;
 
         println!("on generation {}", self.generation);
+        println!("generation took {}ms to generate", now.elapsed().as_millis());
     }
 
     fn rand_pos(&mut self) -> (u32, u32) {

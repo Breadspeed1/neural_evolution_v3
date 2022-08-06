@@ -1,9 +1,10 @@
 use std::fs::File;
+use std::{thread, time};
 use std::time::Instant;
 use image::{EncodableLayout, Frame, ImageBuffer, Rgba, RgbaImage};
 use image::codecs::gif::{GifEncoder};
 use rand::{Rng};
-use show_image::{create_window, Image, ImageInfo, ImageView, WindowProxy};
+use show_image::{create_window, Image, ImageInfo, ImageView, WindowOptions, WindowProxy};
 use crate::agent::Agent;
 
 mod agent;
@@ -17,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let population: u32 = 1000;
     let generate_gifs: bool = false;
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
-        ((20, 64), (108, 64))
+        ((20, 84), (108, 84))
     ];
 
     let mut simulator = Simulator::new(
@@ -37,7 +38,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
-    let generations = 500;
+    let generations = 723048912;
+    let step_time = time::Duration::from_millis(5);
 
     let now = Instant::now();
     while simulator.generation < generations {
@@ -45,6 +47,7 @@ fn run_sim(simulator: &mut Simulator) {
         if simulator.current_steps == 0 {
             println!("on generation {}", simulator.generation);
         }
+        thread::sleep(step_time);
     }
     println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32()/60.0);
 }
@@ -105,6 +108,11 @@ struct Simulator {
 
 impl Simulator {
     fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool) -> Simulator {
+        let mut options: WindowOptions = WindowOptions::default();
+        options.preserve_aspect_ratio = true;
+        options.size = Some([1080 as u32, 1080 as u32]);
+        options.default_controls = false;
+
         Simulator {
             world: vec![0; 128],
             agents: Vec::new(),
@@ -128,7 +136,7 @@ impl Simulator {
             output: GenerationOutput::new(),
             obstacles,
             use_output,
-            window: create_window("g", Default::default()).unwrap()
+            window: create_window("g", options).unwrap()
         }
     }
 
@@ -187,7 +195,7 @@ impl Simulator {
 
         for agent in &mut *self.agents {
             let pos = agent.get_pos();
-            if pos.1 > 63 {
+            if pos.1 > 20 {
                 winners.push(agent.clone());
             }
         }

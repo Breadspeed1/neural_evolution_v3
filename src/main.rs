@@ -8,12 +8,12 @@ use crate::agent::Agent;
 mod agent;
 
 fn main() {
-    let genome_length: u32 = 128;
-    let amount_inners: u32 = 100;
+    let genome_length: u32 = 32;
+    let amount_inners: u32 = 20;
     let mutation_rate: f32 = 0.001;
-    let steps_per_generation: u32 = 200;
+    let steps_per_generation: u32 = 300;
     let population: u32 = 1000;
-    let generate_gifs: bool = true;
+    let generate_gifs: bool = false;
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
         ((20, 64), (108, 64))
     ];
@@ -33,7 +33,9 @@ fn main() {
 
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
-    let generations = 2000;
+    let generations = 60;
+    let est_mins = ((generations as f32 * 0.4014)/60.0) * 1.5;
+    println!("estimated time: {} minutes ({} hours)", est_mins, est_mins/60.0);
 
     let now = Instant::now();
     while simulator.generation < generations {
@@ -42,7 +44,7 @@ fn run_sim(simulator: &mut Simulator) {
             println!("on generation {}", simulator.generation);
         }
     }
-    println!("{} gens took {} seconds", generations, now.elapsed().as_secs_f32());
+    println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32()/60.0);
 }
 
 struct GenerationOutput {
@@ -196,7 +198,7 @@ impl Simulator {
     }
 
     fn step(&mut self) {
-        if self.current_steps >= 200 {
+        if self.current_steps >= self.steps_per_generation {
             self.spawn_next_generation();
             self.current_steps = 0;
             return;

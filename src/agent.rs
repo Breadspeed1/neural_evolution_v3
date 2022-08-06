@@ -188,6 +188,29 @@ impl Brain {
         self.connections.sort_by(|a, b| a.sink_id.cmp(&b.sink_id));
     }
 
+    /*fn filter_connections(&mut self) {
+        let mut to_outer: Vec<Connection> = Vec::new();
+        let mut to_inner: Vec<Connection> = Vec::new();
+
+        for i in 0..self.connections.len() {
+            let connection: Connection = self.connections[i].clone();
+            if self.connections[i].sink_type == 2 {
+                to_outer.push(connection);
+            }
+            else {
+                to_inner.push(connection);
+            }
+        }
+
+        for i in 0..to_inner.len() {
+            if to_outer.iter().any(|x| x.source_id == to_inner[i].sink_id) {
+                to_outer.push(to_inner[i].clone());
+            }
+        }
+
+        self.connections = to_outer;
+    }*/
+
     fn generate_connection_from_genome_segment(&mut self, index: usize) {
         let dec: u32 = self.genome[index];
 
@@ -210,6 +233,7 @@ impl Brain {
                 self.used_input_ids.push(sink_id as usize);
             }
         }
+
 
         //println!("{}-{} {}-{} {}", source_type, source_id, sink_type, sink_id, weight);
 

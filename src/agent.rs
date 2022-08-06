@@ -103,7 +103,7 @@ impl Brain {
             used_input_ids: Vec::new(),
             connections: Vec::new(),
             neurons: vec![
-                vec![0.0; 13],
+                vec![0.0; 14],
                 vec![0.0; amt_inners as usize],
                 vec![0.0; 5]
             ],
@@ -195,20 +195,23 @@ impl Brain {
         let source_id: u8 = binary_util::get_segment(&dec, /*&(0b01111111000000000000000000000000 as u32)*/ 1..=6) as u8 % self.neurons[source_type as usize].len() as u8;
         let sink_type: u8 = binary_util::get_segment(&dec, /*&(0b10000000100000000000000000000000 as u32)*/ 7..=7) as u8 + 1;
         let sink_id: u8 = binary_util::get_segment(&dec, /*&(0b10000000011111110000000000000000 as u32)*/8..=15) as u8 % self.neurons[sink_type as usize].len() as u8;
+        //println!("{}", self.neurons[sink_type as usize].len());
         let weight: f32;
 
         if binary_util::get_segment(&dec, /*&(0b00000000000000001000000000000000 as u32)*/ 16..=16) == 1 {
-            weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / 8000.0;
+            weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / 16000.0;
         }
         else {
-            weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / -8000.0;
+            weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / -16000.0;
         }
 
         if sink_type == 0 {
-            if sink_id > 4 {
+            if sink_id > 6 {
                 self.used_input_ids.push(sink_id as usize);
             }
         }
+
+        //println!("{}-{} {}-{} {}", source_type, source_id, sink_type, sink_id, weight);
 
         self.connections.push(Connection{
             source_type,

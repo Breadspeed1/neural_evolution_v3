@@ -13,6 +13,7 @@ fn main() {
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
+    let generate_gifs: bool = true;
 
     let mut simulator = Simulator::new(
         genome_length,
@@ -20,7 +21,7 @@ fn main() {
         mutation_rate,
         steps_per_generation,
         population,
-        false
+        generate_gifs
     );
 
     run_sim(&mut simulator);
@@ -28,15 +29,16 @@ fn main() {
 
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
+    let generations = 60;
 
     let now = Instant::now();
-    while simulator.generation < 60 {
+    while simulator.generation < generations {
         simulator.step();
         if simulator.current_steps == 0 {
             println!("on generation {}", simulator.generation);
         }
     }
-    println!("60 gens took {} seconds", now.elapsed().as_secs_f32());
+    println!("{} gens took {} seconds", generations, now.elapsed().as_secs_f32());
 }
 
 struct GenerationOutput {
@@ -221,7 +223,7 @@ impl Simulator {
         copy.append(&mut vec![0.0; 8]);
 
         for i in used {
-            let vec: (i32, i32) = self.move_vectors[i - 5];
+            let vec: (i32, i32) = self.move_vectors[i - 7];
             let mut out: f32 = 1.0;
             if self.get_pos(((pos.0 as i32 + vec.0).clamp(0, 127) as u32, (pos.1 as i32 + vec.1).clamp(0, 127) as u32)) {
                 out = 0.0;
@@ -239,16 +241,27 @@ impl Simulator {
     2: oscillator
     3: age
     4: random
-    5-12: can move in x direction
+    5: ns population gradient
+    6: ew population gradient
+    7-14: can move in x direction
     */
     fn calc_step_inputs(&mut self) -> Vec<f32> {
-        let mut inputs: Vec<f32> = vec![0.0; 5];
+        let mut inputs: Vec<f32> = vec![0.0; 7];
+        let mut av: (u32, u32) = (0, 0);
+
+        for a in &mut *self.agents {
+            av = (av.0 + a.get_pos().0, av.0 + a.get_pos().0);
+        }
+
+        av = (av.0 / self.agents.len() as u32, av.1 / self.agents.len() as u32);
 
         inputs[0] = 0.0;
         inputs[1] = 1.0;
         inputs[2] = (self.current_steps % 2) as f32;
         inputs[3] = self.current_steps as f32/self.steps_per_generation as f32;
         inputs[4] = rand::thread_rng().gen_range(0.0..1.0);
+        inputs[5] = av.1 as f32 / 127.0;
+        inputs[6] = av.0 as f32 / 127.0;
 
         inputs
     }

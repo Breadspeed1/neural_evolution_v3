@@ -1,6 +1,10 @@
 use std::fs::File;
 use std::{thread, time};
-use std::time::Instant;
+use std::ops::{Add, AddAssign, Sub, SubAssign};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, read};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use image::{EncodableLayout, Frame, ImageBuffer, Rgba, RgbaImage};
 use image::codecs::gif::{GifEncoder};
 use rand::{Rng};
@@ -39,7 +43,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
     let generations = 723048912;
-    let step_time = time::Duration::from_millis(5);
+    let step_time_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(5));
+
+    enable_raw_mode().unwrap();
+
+    let step_time = Arc::clone(&step_time_mutex);
+    thread::spawn( move || {
+        loop {
+            match read().unwrap() {
+                Event::Key(KeyEvent {
+                               code: KeyCode::Char('q'),
+                               modifiers: KeyModifiers::NONE
+                           }) => {
+                    if *step_time.lock().unwrap() >= 5 {
+                        step_time.lock().unwrap().sub_assign(5);
+                        println!("step delay changed to {}ms", *step_time.lock().unwrap());
+                    }
+                },
+
+                Event::Key(KeyEvent {
+                               code: KeyCode::Char('e'),
+                               modifiers: KeyModifiers::NONE
+                           }) => {
+                    step_time.lock().unwrap().add_assign(5);
+                    println!("step delay changed to {}ms", *step_time.lock().unwrap());
+                },
+
+                _ => ()
+            }
+        }
+    });
 
     let now = Instant::now();
     while simulator.generation < generations {
@@ -47,7 +80,7 @@ fn run_sim(simulator: &mut Simulator) {
         if simulator.current_steps == 0 {
             println!("on generation {}", simulator.generation);
         }
-        thread::sleep(step_time);
+        thread::sleep(Duration::from_millis(*step_time_mutex.lock().unwrap()));
     }
     println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32()/60.0);
 }

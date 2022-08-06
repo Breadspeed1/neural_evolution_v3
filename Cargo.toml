@@ -12,3 +12,4 @@ serde_json = {version = "1.0.81"}
 serde = {version = "1.0.137", default-features = false, features = ["derive", "serde_derive"]}
 image = "0.24.3"
 show-image = "0.12.3"
+crossterm = "0.24.0"

@@ -26,9 +26,11 @@ fn main() {
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
 
-    loop {
+    let now = Instant::now();
+    while simulator.generation < 60 {
         simulator.step();
     }
+    println!("60 generations took {} seconds", now.elapsed().as_secs_f32());
 }
 
 struct Simulator {
@@ -127,7 +129,6 @@ impl Simulator {
     }
 
     fn step(&mut self) {
-        let now = Instant::now();
         if self.current_steps >= 200 {
             self.spawn_next_generation();
             self.current_steps = 0;
@@ -152,7 +153,6 @@ impl Simulator {
         }
 
         self.current_steps += 1;
-        println!("step {} took {} milliseconds", self.current_steps, now.elapsed().as_millis());
     }
 
 

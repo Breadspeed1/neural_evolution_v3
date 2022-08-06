@@ -36,8 +36,7 @@ fn run_sim(simulator: &mut Simulator) {
 }
 
 struct Simulator {
-    world: Vec<Vec<u64>>,
-    agents: HashSet<Agent>,
+    agents: Vec<Agent>,
     generation: u32,
     current_steps: u32,
     genome_length: u32,
@@ -52,8 +51,7 @@ struct Simulator {
 impl Simulator {
     fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, world_size: (u16, u16)) -> Simulator {
         Simulator {
-            world: vec![vec![0; world_size.1 as usize]; world_size.0 as usize],
-            agents: HashSet::new(),
+            agents: Vec::new(),
             generation: 0,
             current_steps: 0,
             genome_length,

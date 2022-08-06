@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
+use std::time::Instant;
 use rand::{Rng};
 use serde::{Serialize};
 use crate::agent::Agent;
@@ -7,8 +8,8 @@ use crate::agent::Agent;
 mod agent;
 
 fn main() {
-    let genome_length: u32 = 32;
-    let amount_inners: u32 = 20;
+    let genome_length: u32 = 2;
+    let amount_inners: u32 = 1;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
@@ -29,10 +30,13 @@ fn main() {
 
 fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
+    let now = Instant::now();
 
-    loop {
+    while simulator.generation <= 60 {
         simulator.step();
     }
+
+    println!("60 gens took {} seconds", now.elapsed().as_secs_f32());
 }
 
 struct Simulator {

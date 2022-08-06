@@ -1,3 +1,4 @@
+use std::time::Instant;
 use rand::{Rng};
 use crate::agent::Agent;
 
@@ -75,7 +76,6 @@ impl Simulator {
 
         for i in 0..self.population {
             let mut a: Agent = self.agents[i as usize % self.agents.len()].clone();
-
             new_generation.push(a.produce_child(
                 self.mutation_rate,
                 self.rand_pos()
@@ -127,6 +127,7 @@ impl Simulator {
     }
 
     fn step(&mut self) {
+        let now = Instant::now();
         if self.current_steps >= 200 {
             self.spawn_next_generation();
             self.current_steps = 0;
@@ -135,6 +136,7 @@ impl Simulator {
 
         let inputs = self.calc_step_inputs();
 
+        let mut k = 0;
         for i in 0..self.agents.len() {
             let agent: Agent = self.agents[i].clone();
             let all_inputs = self.calc_positional_inputs(agent.get_pos(), &inputs);
@@ -146,24 +148,13 @@ impl Simulator {
                 self.agents[i].set_pos(pos);
                 self.toggle_pos(pos);
             }
+            k += 1;
         }
 
         self.current_steps += 1;
+        println!("step {} took {} milliseconds", self.current_steps, now.elapsed().as_millis());
     }
 
-    /*fn add_state(&mut self, s: (u64, (u32, u32))) {
-        let l = self.state_len();
-        if l > 0 {
-            self.states.states[l - 1].push(s);
-        }
-        else {
-            self.states.states.push(vec![s])
-        }
-    }*/
-
-    /*fn state_len(&mut self) -> usize {
-        self.states.states.len()
-    }*/
 
     fn calc_positional_inputs(&mut self, pos: (u32, u32), base: &Vec<f32>) -> Vec<f32> {
         let mut copy = base.clone();

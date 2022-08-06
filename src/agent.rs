@@ -13,15 +13,15 @@ pub fn test() {
 
 #[derive(Serialize)]
 pub struct Agent {
-    pub id: u64,
     pub genome: Vec<u32>,
+    pub pos: (u32, u32),
     brain: Brain
 }
 
 impl Clone for Agent {
     fn clone(&self) -> Self {
         Agent {
-            id: self.id,
+            pos: self.pos,
             genome: self.genome.clone(),
             brain: self.brain.clone()
         }
@@ -29,24 +29,32 @@ impl Clone for Agent {
 }
 
 impl Agent {
-    pub fn new(genome: &Vec<u32>, amt_inners: u8, id: u64) -> Agent {
+    pub fn new(genome: &Vec<u32>, amt_inners: u8, pos: (u32, u32)) -> Agent {
         Agent {
-            id,
+            pos,
             genome: genome.clone(),
             brain: Brain::from(genome.clone(), amt_inners)
         }
+    }
+
+    pub fn set_pos(&mut self, pos: (u32, u32)) {
+        self.pos = pos;
+    }
+
+    pub fn get_pos(&self) -> (u32, u32) {
+        self.pos
     }
 
     pub fn step(&mut self, input: Vec<f32>) -> (i32, i32) {
         self.brain.step(input)
     }
 
-    pub fn produce_child(&mut self, mutation_rate: f32, id: u64) -> Agent {
+    pub fn produce_child(&mut self, mutation_rate: f32, pos: (u32, u32)) -> Agent {
         let mut rng = rand::thread_rng();
         let genome = self.mutate_genome(mutation_rate);
 
         Agent {
-            id,
+            pos,
             genome: genome.clone(),
             brain: Brain::from(genome, self.brain.neurons[1].len() as u8)
         }
@@ -65,26 +73,6 @@ impl Agent {
         }
 
         out
-    }
-}
-
-impl PartialEq for Agent {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Borrow<u64> for Agent {
-    fn borrow(&self) -> &u64 {
-        &self.id
-    }
-}
-
-impl Eq for Agent {}
-
-impl Hash for Agent {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
     }
 }
 

@@ -1,7 +1,4 @@
-use std::collections::HashSet;
-use std::fs;
 use rand::{Rng};
-use serde::{Serialize};
 use crate::agent::Agent;
 
 mod agent;
@@ -12,15 +9,13 @@ fn main() {
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
-    let world_size: (u16, u16) = (128, 128);
 
     let mut simulator = Simulator::new(
         genome_length,
         amount_inners,
         mutation_rate,
         steps_per_generation,
-        population,
-        world_size
+        population
     );
 
     //agent::test();
@@ -36,6 +31,7 @@ fn run_sim(simulator: &mut Simulator) {
 }
 
 struct Simulator {
+    world: Vec<u128>,
     agents: Vec<Agent>,
     generation: u32,
     current_steps: u32,
@@ -44,13 +40,13 @@ struct Simulator {
     mutation_rate: f32,
     steps_per_generation: u32,
     population: u32,
-    world_size: (u16, u16),
-    move_vectors: Vec<(i8, i8)>
+    move_vectors: Vec<(i32, i32)>
 }
 
 impl Simulator {
-    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, world_size: (u16, u16)) -> Simulator {
+    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32) -> Simulator {
         Simulator {
+            world: vec![0; 128],
             agents: Vec::new(),
             generation: 0,
             current_steps: 0,
@@ -59,7 +55,6 @@ impl Simulator {
             mutation_rate,
             steps_per_generation,
             population,
-            world_size,
             move_vectors: vec![
             (0, 1),
             (0, -1),
@@ -76,71 +71,59 @@ impl Simulator {
     fn spawn_next_generation(&mut self) {
         self.generation += 1;
         self.remove_losers();
-        let mut new_generation: HashSet<Agent> = HashSet::new();
-        let mut ids: Vec<u64> = Vec::new();
-        let mut rand = rand::thread_rng();
+        let mut new_generation: Vec<Agent> = Vec::new();
 
-        let mut i: u64 = 0;
-        self.agents.iter().for_each(|x| {ids.push(x.id)});
-        while new_generation.len() != self.population as usize {
-            let mut a: Agent = self.agents.take(&ids[rand.gen_range(0..ids.len())]).unwrap();
-            new_generation.insert(a.produce_child(self.mutation_rate, i));
-            self.add_agent(a);
-            i += 1;
+        for i in 0..self.population {
+            let mut a: Agent = self.agents[i as usize % self.agents.len()].clone();
+
+            new_generation.push(a.produce_child(
+                self.mutation_rate,
+                self.rand_pos()
+            ));
         }
 
         self.agents = new_generation;
-        self.populate_world();
-        self.reset_generation();
 
         println!("on generation {}", self.generation);
     }
 
-    fn reset_generation(&mut self) {
-        let mut new_agents: Vec<(u64, Vec<u32>)> = Vec::new();
-        self.agents.iter().for_each(|x| new_agents.push((x.id, x.genome.clone())));
+    fn rand_pos(&mut self) -> (u32, u32) {
+        let mut rand = rand::thread_rng();
+        let mut pos: (u32, u32) = (rand.gen_range(0..127), rand.gen_range(0..127));
+        while self.get_pos(pos) {
+            pos = (rand.gen_range(0..127), rand.gen_range(0..127));
+        }
+        self.toggle_pos(pos);
+
+        pos
     }
 
-    /*fn generation_to_json(&mut self) {
-        let j = serde_json::to_string(&self.states);
-        fs::write(format!("G:\\\\output\\{}.json", self.generation - 1), j.unwrap().to_string()).expect("error writing file");
-    }*/
+    fn toggle_pos(&mut self, coords: (u32, u32)) {
+        let mask = (2 as u128).pow(coords.1);
+        self.world[coords.0 as usize] ^= mask;
+    }
 
-    fn populate_world(&mut self) {
-        let mut taken_pos: HashSet<(u32, u32)> = HashSet::new();
-        let mut rng = rand::thread_rng();
-
-        for a in self.agents.iter() {
-            let mut  pos: (u32, u32) = (rng.gen_range(0..self.world_size.0) as u32, rng.gen_range(0..self.world_size.1) as u32);
-            while !taken_pos.insert(pos) {
-                pos = (rng.gen_range(0..self.world_size.0) as u32, rng.gen_range(0..self.world_size.1) as u32);
-            }
-
-            self.world[pos.0 as usize][pos.1 as usize] = a.id;
-        }
+    fn get_pos(&mut self, coords: (u32, u32)) -> bool {
+        let mask = (2 as u128).pow(coords.1);
+        (self.world[coords.0 as usize] & mask)/mask == 1
     }
 
     fn remove_losers(&mut self) {
-        for i in 0..self.world_size.0 {
-            for j in 0..self.world_size.1 {
-                let id = self.world[i as usize][j as usize];
-                if id != 0 {
-                    if j < 64 {
-                        self.remove_agent(id);
-                    }
-                }
+        let mut winners: Vec<Agent> = Vec::new();
+
+        for agent in &mut *self.agents {
+            let pos = agent.get_pos();
+            if pos.1 > 63 {
+                winners.push(agent.clone());
             }
         }
 
+        self.agents = winners;
         self.clear_world();
     }
 
     fn clear_world(&mut self) {
-        self.world = vec![vec![0; self.world_size.1 as usize]; self.world_size.0 as usize];
-    }
-
-    fn remove_agent(&mut self, id: u64) {
-        self.agents.remove(&id);
+        self.world = vec![0; 128];
     }
 
     fn step(&mut self) {
@@ -151,35 +134,18 @@ impl Simulator {
         }
 
         let inputs = self.calc_step_inputs();
-        let mut requested_moves: Vec<(i32, i32)> = Vec::new();
-        let mut requested_move_ids: Vec<u64> = Vec::new();
 
-        for i in 0..self.world_size.0 {
-            for j in 0..self.world_size.1 {
-                let id = self.world[i as usize][j as usize];
-                if id != 0 {
-                    let mut a = self.get_agent(id);
-                    let translation: (i32, i32) = a.step(self.calc_positional_inputs((i as i32, j as i32), inputs.clone()));
-                    let pos: (i32, i32) = (translation.0 + i as i32, translation.1 + j as i32);
+        for i in 0..self.agents.len() {
+            let agent: Agent = self.agents[i].clone();
+            let all_inputs = self.calc_positional_inputs(agent.get_pos(), &inputs);
+            let translation: (i32, i32) = self.agents[i].step(all_inputs);
+            let pos: (u32, u32) = ((agent.pos.0 as i32 + translation.0).clamp(0, 127) as u32, (agent.pos.1 as i32 + translation.1).clamp(0, 127) as u32);
 
-                    if self.pos_free(pos) && !requested_moves.contains(&pos) {
-                        requested_moves.push(pos);
-                        requested_move_ids.push(id);
-                    }
-                    else {
-                        requested_moves.push((i as i32, j as i32));
-                        requested_move_ids.push(id)
-                    }
-
-                    self.add_agent(a);
-                }
+            if !self.get_pos(pos) {
+                self.toggle_pos(agent.get_pos());
+                self.agents[i].set_pos(pos);
+                self.toggle_pos(pos);
             }
-        }
-
-        self.clear_world();
-
-        for i in 0..requested_moves.len() {
-            self.world[requested_moves[i].0 as usize][requested_moves[i].1 as usize] = requested_move_ids[i];
         }
 
         self.current_steps += 1;
@@ -199,22 +165,14 @@ impl Simulator {
         self.states.states.len()
     }*/
 
-    fn add_agent(&mut self, agent: Agent) {
-        self.agents.insert(agent);
-    }
-
-    fn get_agent(&mut self, id: u64) -> Agent {
-        self.agents.take(&id).unwrap()
-    }
-
-    fn calc_positional_inputs(&mut self, pos: (i32, i32), base: Vec<f32>) -> Vec<f32> {
+    fn calc_positional_inputs(&mut self, pos: (u32, u32), base: &Vec<f32>) -> Vec<f32> {
         let mut copy = base.clone();
 
         for i in 0..self.move_vectors.len() {
-            let vec: (i8, i8) = self.move_vectors[i];
-            let mut out: f32 = 0.0;
-            if self.pos_free((pos.0 + vec.0 as i32, pos.1 + vec.1 as i32)) {
-                out = 1.0;
+            let vec: (i32, i32) = self.move_vectors[i];
+            let mut out: f32 = 1.0;
+            if self.get_pos(((pos.0 as i32 + vec.0).clamp(0, 127) as u32, (pos.1 as i32 + vec.1).clamp(0, 127) as u32)) {
+                out = 0.0;
             }
 
            copy.push(out);
@@ -243,44 +201,24 @@ impl Simulator {
         inputs
     }
 
-    fn pos_free(&mut self, pos: (i32, i32)) -> bool {
-        if pos.0 >= self.world_size.0 as i32 || pos.0 < 0 {
-            return false;
-        }
-        if pos.1 >= self.world_size.1 as i32 || pos.1 < 0 {
-            return false;
-        }
-        if self.world[pos.0 as usize][pos.1 as usize] != 0 {
-            return false;
-        }
-        return true;
+    fn random_genome(&self) -> Vec<u32> {
+        let mut genome: Vec<u32> = Vec::new();
+        let mut rand = rand::thread_rng();
+
+        (0..self.genome_length).for_each(|_| {genome.push(rand.gen::<u32>())});
+
+        genome
     }
 
     fn generate_initial_generation(&mut self) {
-        let mut taken_pos: HashSet<(u32, u32)> = HashSet::new();
-        let mut rng = rand::thread_rng();
+        for _ in 0..self.population {
+            let pos: (u32, u32) = self.rand_pos();
 
-        for i in 0..self.population {
-            let mut  pos: (u32, u32) = (rng.gen_range(0..self.world_size.0) as u32, rng.gen_range(0..self.world_size.1) as u32);
-            while !taken_pos.insert(pos) {
-                pos = (rng.gen_range(0..self.world_size.0) as u32, rng.gen_range(0..self.world_size.1) as u32);
-            }
-            let mut genome: Vec<u32> = Vec::new();
-
-            for i in 0..self.genome_length {
-                genome.push(rng.gen::<u32>());
-            }
-
-            let agent: Agent = Agent::new(
-                &genome,
+            self.agents.push(Agent::new(
+                &self.random_genome(),
                 self.amount_inners as u8,
-                i as u64
-            );
-
-            self.world[pos.0 as usize][pos.1 as usize] = agent.id;
-            self.agents.insert(agent);
+                pos
+            ));
         }
-
-        self.reset_generation();
     }
 }

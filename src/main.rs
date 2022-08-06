@@ -1,8 +1,4 @@
 use std::fs::File;
-use std::{mem, thread};
-use std::ops::Range;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::Instant;
 use image::{Frame, ImageBuffer, RgbaImage};
 use image::codecs::gif::{GifEncoder};
@@ -41,30 +37,12 @@ fn run_sim(simulator: &mut Simulator) {
 
     let now = Instant::now();
     while simulator.generation < generations {
-
-        step(simulator);
-
+        simulator.step();
         if simulator.current_steps == 0 {
             println!("on generation {}", simulator.generation);
         }
     }
     println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32()/60.0);
-}
-
-fn step(simulator: &mut Simulator) {
-    if simulator.step_or_generation() {
-        let inputs: Vec<f32> = simulator.calc_step_inputs();
-        let mut handles: Vec<JoinHandle<()>> = Vec::new();
-
-        for i in 0 as usize..=10 {
-            handles.push(thread::spawn( move || {
-                simulator.handle_agents((i * 100)..((i + 1) * 100), &inputs);
-            }));
-        }
-    }
-    else {
-        simulator.spawn_next_generation();
-    }
 }
 
 struct GenerationOutput {
@@ -105,8 +83,8 @@ impl GenerationOutput {
 }
 
 struct Simulator {
-    world: Arc<Mutex<Vec<u128>>>,
-    agents: Arc<Mutex<Vec<Agent>>>,
+    world: Vec<u128>,
+    agents: Vec<Agent>,
     generation: u32,
     current_steps: u32,
     genome_length: u32,
@@ -123,8 +101,8 @@ struct Simulator {
 impl Simulator {
     fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool) -> Simulator {
         Simulator {
-            world: Arc::new(Mutex::new(vec![0; 128])),
-            agents: Arc::new(Mutex::new(Vec::new())),
+            world: vec![0; 128],
+            agents: Vec::new(),
             generation: 0,
             current_steps: 0,
             genome_length,
@@ -148,34 +126,6 @@ impl Simulator {
         }
     }
 
-    fn step_or_generation(&mut self) -> bool {
-        self.current_steps < self.steps_per_generation
-    }
-
-    fn handle_agents(&mut self, rows: Range<usize>, inputs: &Vec<f32>) {
-        for i in rows {
-            let agent: &Agent = &self.agents.lock().unwrap()[i];
-            let agent_pos: (u32, u32) = agent.get_pos();
-            let used: Vec<usize> = agent.get_used_inputs();
-            let all_inputs = self.calc_positional_inputs(agent_pos, &inputs, used);
-            let translation: (i32, i32) = self.agents.lock().unwrap()[i].step(all_inputs);
-            let pos: (u32, u32) = ((agent_pos.0 as i32 + translation.0).clamp(0, 127) as u32, (agent_pos.1 as i32 + translation.1).clamp(0, 127) as u32);
-
-            if !self.get_pos(pos) {
-                self.toggle_pos(agent_pos);
-                self.agents.lock().unwrap()[i].set_pos(pos);
-                self.toggle_pos(pos);
-            }
-        }
-    }
-
-    fn end_step(&mut self) {
-        if self.use_output {
-            self.update_output();
-        }
-        self.current_steps += 1;
-    }
-
     fn spawn_next_generation(&mut self) {
         if self.use_output {
             self.reset_output()
@@ -186,15 +136,14 @@ impl Simulator {
         let mut new_generation: Vec<Agent> = Vec::new();
 
         for i in 0..self.population {
-            let mut a: Agent = self.agents.lock().unwrap()[i as usize % self.agents.lock().unwrap().len()].clone();
+            let mut a: Agent = self.agents[i as usize % self.agents.len()].clone();
             new_generation.push(a.produce_child(
                 self.mutation_rate,
                 self.rand_pos()
             ));
         }
 
-        let mut state = self.agents.lock().unwrap();
-        mem::replace(&mut *state, Vec::new());
+        self.agents = new_generation;
     }
 
     fn rand_pos(&mut self) -> (u32, u32) {
@@ -209,7 +158,7 @@ impl Simulator {
     }
 
     fn update_output(&mut self) {
-        self.output.add_step(self.world.lock().unwrap().clone());
+        self.output.add_step(self.world.clone());
     }
 
     fn reset_output(&mut self) {
@@ -219,38 +168,34 @@ impl Simulator {
 
     fn toggle_pos(&mut self, coords: (u32, u32)) {
         let mask = (2 as u128).pow(coords.1);
-        self.world.lock().unwrap()[coords.0 as usize] ^= mask;
+        self.world[coords.0 as usize] ^= mask;
     }
 
     fn get_pos(&mut self, coords: (u32, u32)) -> bool {
         let mask = (2 as u128).pow(coords.1);
-        (self.world.lock().unwrap()[coords.0 as usize] & mask)/mask == 1
+        (self.world[coords.0 as usize] & mask)/mask == 1
     }
 
     fn remove_losers(&mut self) {
         let mut winners: Vec<Agent> = Vec::new();
 
-        for agent in &mut *self.agents.lock().unwrap() {
+        for agent in &mut *self.agents {
             let pos = agent.get_pos();
             if pos.1 > 63 {
                 winners.push(agent.clone());
             }
         }
 
-        let mut state = self.agents.lock().unwrap();
-        mem::replace(&mut *state, winners);
-
+        self.agents = winners;
         self.clear_world();
     }
 
     fn clear_world(&mut self) {
-        let mut state = self.world.lock().unwrap();
-        mem::replace(&mut *state, vec![0; 128]);
-
+        self.world = vec![0; 128];
         self.add_obstacles();
     }
 
-    /*fn step(&mut self) {
+    fn step(&mut self) {
         if self.current_steps >= self.steps_per_generation {
             self.spawn_next_generation();
             self.current_steps = 0;
@@ -277,7 +222,7 @@ impl Simulator {
             self.update_output();
         }
         self.current_steps += 1;
-    }*/
+    }
 
 
     fn calc_positional_inputs(&mut self, pos: (u32, u32), base: &Vec<f32>, used: Vec<usize>) -> Vec<f32> {
@@ -311,12 +256,11 @@ impl Simulator {
         let mut inputs: Vec<f32> = vec![0.0; 7];
         let mut av: (u32, u32) = (0, 0);
 
-        for a in &mut *self.agents.lock().unwrap() {
+        for a in &mut *self.agents {
             av = (av.0 + a.get_pos().0, av.0 + a.get_pos().0);
         }
 
-        let len = self.agents.lock().unwrap().len();
-        av = (av.0 / len as u32, av.1 / len as u32);
+        av = (av.0 / self.agents.len() as u32, av.1 / self.agents.len() as u32);
 
         inputs[0] = 0.0;
         inputs[1] = 1.0;
@@ -344,7 +288,7 @@ impl Simulator {
             (obstacle.0.1..=obstacle.1.1).for_each(|x| mask += (2 as u128).pow(x));
 
             for x in obstacle.0.0..=obstacle.1.0 {
-                self.world.lock().unwrap()[x as usize] |= mask;
+                self.world[x as usize] |= mask;
                 //println!("{}", self.world[x as usize]);
             }
         }
@@ -354,7 +298,7 @@ impl Simulator {
         for _ in 0..self.population {
             let pos: (u32, u32) = self.rand_pos();
 
-            self.agents.lock().unwrap().push(Agent::new(
+            self.agents.push(Agent::new(
                 &self.random_genome(),
                 self.amount_inners as u8,
                 pos

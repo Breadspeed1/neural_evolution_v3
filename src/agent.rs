@@ -8,7 +8,9 @@ mod binary_util;
 pub struct Agent {
     pub genome: Vec<u32>,
     pub pos: (u32, u32),
-    brain: Brain
+    brain: Brain,
+    rgba: [u8; 4],
+    amt_inners: u8
 }
 
 impl Clone for Agent {
@@ -16,7 +18,9 @@ impl Clone for Agent {
         Agent {
             pos: self.pos,
             genome: self.genome.clone(),
-            brain: self.brain.clone()
+            brain: self.brain.clone(),
+            rgba: self.get_rgba(),
+            amt_inners: self.amt_inners
         }
     }
 }
@@ -26,7 +30,9 @@ impl Agent {
         Agent {
             pos,
             genome: genome.clone(),
-            brain: Brain::from(genome.clone(), amt_inners)
+            brain: Brain::from(genome.clone(), amt_inners),
+            rgba: Agent::calc_rgba(genome),
+            amt_inners
         }
     }
 
@@ -48,12 +54,28 @@ impl Agent {
 
     pub fn produce_child(&mut self, mutation_rate: f32, pos: (u32, u32)) -> Agent {
         let genome = self.mutate_genome(mutation_rate);
+        Agent::new(
+            &genome,
+            self.amt_inners,
+            pos
+        )
+    }
 
-        Agent {
-            pos,
-            genome: genome.clone(),
-            brain: Brain::from(genome, self.brain.neurons[1].len() as u8)
-        }
+    pub fn get_rgba(&self) -> [u8; 4] {
+        self.rgba
+    }
+
+    pub fn calc_rgba(genome: &Vec<u32>) -> [u8; 4] {
+        let mut av: f32 = 0.0;
+        genome.iter().for_each(|x| av += *x as f32);
+        let bits = av.to_bits();
+
+        [
+            binary_util::get_segment(&bits, 0..=7) as u8,
+            binary_util::get_segment(&bits, 8..=15) as u8,
+            binary_util::get_segment(&bits, 16..=23) as u8,
+            255
+        ]
     }
 
     fn mutate_genome(&mut self, mutation_rate: f32) -> Vec<u32> {
@@ -187,29 +209,6 @@ impl Brain {
 
         self.connections.sort_by(|a, b| a.sink_id.cmp(&b.sink_id));
     }
-
-    /*fn filter_connections(&mut self) {
-        let mut to_outer: Vec<Connection> = Vec::new();
-        let mut to_inner: Vec<Connection> = Vec::new();
-
-        for i in 0..self.connections.len() {
-            let connection: Connection = self.connections[i].clone();
-            if self.connections[i].sink_type == 2 {
-                to_outer.push(connection);
-            }
-            else {
-                to_inner.push(connection);
-            }
-        }
-
-        for i in 0..to_inner.len() {
-            if to_outer.iter().any(|x| x.source_id == to_inner[i].sink_id) {
-                to_outer.push(to_inner[i].clone());
-            }
-        }
-
-        self.connections = to_outer;
-    }*/
 
     fn generate_connection_from_genome_segment(&mut self, index: usize) {
         let dec: u32 = self.genome[index];

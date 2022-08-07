@@ -1,21 +1,31 @@
 use std::fs::File;
-use std::time::Instant;
-use image::{Frame, ImageBuffer, RgbaImage};
+use std::{thread, time};
+use std::ops::{Add, AddAssign, Not, Sub, SubAssign};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, read};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use image::{EncodableLayout, Frame, ImageBuffer, Rgba, RgbaImage};
 use image::codecs::gif::{GifEncoder};
 use rand::{Rng};
+use show_image::{create_window, Image, ImageInfo, ImageView, WindowOptions, WindowProxy};
 use crate::agent::Agent;
 
 mod agent;
 
-fn main() {
-    let genome_length: u32 = 32;
-    let amount_inners: u32 = 20;
+#[show_image::main]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let genome_length: u32 = 256;
+    let amount_inners: u32 = 225;
     let mutation_rate: f32 = 0.001;
-    let steps_per_generation: u32 = 300;
+    let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
     let generate_gifs: bool = false;
+    let toggle: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
-        ((20, 64), (108, 64))
+        ((10, 108), (118, 108)),
+        /*((10, 107), (10, 20)),
+        ((118, 107), (118, 20))*/
     ];
 
     let mut simulator = Simulator::new(
@@ -25,15 +35,57 @@ fn main() {
         steps_per_generation,
         population,
         obstacles,
-        generate_gifs
+        generate_gifs,
+        Arc::clone(&toggle)
     );
 
-    run_sim(&mut simulator);
+    run_sim(&mut simulator, Arc::clone(&toggle));
+
+    Ok(())
 }
 
-fn run_sim(simulator: &mut Simulator) {
+fn run_sim(simulator: &mut Simulator, toggle: Arc<Mutex<bool>>) {
     simulator.generate_initial_generation();
-    let generations = 60;
+    let generations = 723048912;
+    let step_time_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(5));
+
+    enable_raw_mode().unwrap();
+
+    let step_time = Arc::clone(&step_time_mutex);
+    thread::spawn( move || {
+        loop {
+            match read().unwrap() {
+                Event::Key(KeyEvent {
+                               code: KeyCode::Char('q'),
+                               modifiers: KeyModifiers::NONE
+                           }) => {
+                    if *step_time.lock().unwrap() >= 5 {
+                        step_time.lock().unwrap().sub_assign(5);
+                        println!("step delay changed to {}ms", *step_time.lock().unwrap());
+                    }
+                },
+
+                Event::Key(KeyEvent {
+                               code: KeyCode::Char('e'),
+                               modifiers: KeyModifiers::NONE
+                           }) => {
+                    step_time.lock().unwrap().add_assign(5);
+                    println!("step delay changed to {}ms", *step_time.lock().unwrap());
+                },
+
+                Event::Key(KeyEvent {
+                               code: KeyCode::Char('v'),
+                               modifiers: KeyModifiers::NONE
+                           }) => {
+                    let val = *toggle.lock().unwrap();
+                    *toggle.lock().unwrap() = !val;
+                    println!("toggling display");
+                },
+
+                _ => ()
+            }
+        }
+    });
 
     let now = Instant::now();
     while simulator.generation < generations {
@@ -41,6 +93,7 @@ fn run_sim(simulator: &mut Simulator) {
         if simulator.current_steps == 0 {
             println!("on generation {}", simulator.generation);
         }
+        thread::sleep(Duration::from_millis(*step_time_mutex.lock().unwrap()));
     }
     println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32()/60.0);
 }
@@ -95,11 +148,18 @@ struct Simulator {
     move_vectors: Vec<(i32, i32)>,
     output: GenerationOutput,
     obstacles: Vec<((u32, u32), (u32, u32))>,
-    use_output: bool
+    use_output: bool,
+    window: WindowProxy,
+    toggle: Arc<Mutex<bool>>
 }
 
 impl Simulator {
-    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool) -> Simulator {
+    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool, toggle: Arc<Mutex<bool>>) -> Simulator {
+        let mut options: WindowOptions = WindowOptions::default();
+        options.preserve_aspect_ratio = true;
+        options.size = Some([1080 as u32, 1080 as u32]);
+        options.default_controls = false;
+
         Simulator {
             world: vec![0; 128],
             agents: Vec::new(),
@@ -122,7 +182,9 @@ impl Simulator {
             ],
             output: GenerationOutput::new(),
             obstacles,
-            use_output
+            use_output,
+            window: create_window("g", options).unwrap(),
+            toggle
         }
     }
 
@@ -181,7 +243,7 @@ impl Simulator {
 
         for agent in &mut *self.agents {
             let pos = agent.get_pos();
-            if pos.1 > 63 {
+            if pos.1 > 108 {
                 winners.push(agent.clone());
             }
         }
@@ -201,6 +263,13 @@ impl Simulator {
             self.current_steps = 0;
             return;
         }
+        let show_image = *self.toggle.lock().unwrap();
+
+        let mut image: RgbaImage = RgbaImage::default();
+        if show_image {
+            image = ImageBuffer::new(128, 128);
+            image.fill(u8::MAX);
+        }
 
         let inputs = self.calc_step_inputs();
 
@@ -216,12 +285,22 @@ impl Simulator {
                 self.agents[i].set_pos(pos);
                 self.toggle_pos(pos);
             }
+
+            if show_image {
+                let mut pix = image.get_pixel_mut(pos.0, pos.1);
+                pix.0 = self.agents[i].get_rgba();
+            }
+        }
+
+        self.current_steps += 1;
+
+        if show_image {
+            self.window.set_image("generation x", ImageView::new(ImageInfo::rgba8(128, 128), image.as_bytes())).unwrap();
         }
 
         if self.use_output {
             self.update_output();
         }
-        self.current_steps += 1;
     }
 
 
@@ -289,7 +368,6 @@ impl Simulator {
 
             for x in obstacle.0.0..=obstacle.1.0 {
                 self.world[x as usize] |= mask;
-                //println!("{}", self.world[x as usize]);
             }
         }
     }

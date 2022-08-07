@@ -22,7 +22,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let population: u32 = 1000;
     let generate_gifs: bool = false;
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
-        ((10, 108), (118, 108))
+        ((10, 108), (118, 108)),
+        /*((10, 107), (10, 20)),
+        ((118, 107), (118, 20))*/
     ];
 
     let mut simulator = Simulator::new(
@@ -228,7 +230,7 @@ impl Simulator {
 
         for agent in &mut *self.agents {
             let pos = agent.get_pos();
-            if pos.1 > 20 {
+            if pos.1 > 108 {
                 winners.push(agent.clone());
             }
         }
@@ -345,7 +347,6 @@ impl Simulator {
 
             for x in obstacle.0.0..=obstacle.1.0 {
                 self.world[x as usize] |= mask;
-                //println!("{}", self.world[x as usize]);
             }
         }
     }

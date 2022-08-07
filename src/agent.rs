@@ -66,14 +66,14 @@ impl Agent {
     }
 
     pub fn calc_rgba(genome: &Vec<u32>) -> [u8; 4] {
-        let mut av: u128 = 0;
-        genome.iter().for_each(|x| av += *x as u128);
-        av /= genome.len() as u128;
+        let mut av: f32 = 0.0;
+        genome.iter().for_each(|x| av += *x as f32);
+        let bits = av.to_bits();
 
         [
-            binary_util::get_segment(&(av as u32), 0..=7) as u8,
-            binary_util::get_segment(&(av as u32), 8..=15) as u8,
-            binary_util::get_segment(&(av as u32), 16..=23) as u8,
+            binary_util::get_segment(&bits, 0..=7) as u8,
+            binary_util::get_segment(&bits, 8..=15) as u8,
+            binary_util::get_segment(&bits, 16..=23) as u8,
             255
         ]
     }

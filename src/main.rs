@@ -156,6 +156,15 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
 fn draw_world(simulator: &Simulator, image: &mut Image, texture: &Texture2D) {
     let pixels = image.get_image_data_mut();
     pixels.fill([255, 255, 255, 255]);
+    // Draw obstacle walls in gray so the challenge geometry is visible; agents
+    // are painted on top.
+    for &((x0, y0), (x1, y1)) in &simulator.obstacles {
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                pixels[(y * 128 + x) as usize] = [110, 110, 110, 255];
+            }
+        }
+    }
     for agent in &simulator.agents {
         let (x, y) = agent.get_pos();
         pixels[(y * 128 + x) as usize] = agent.get_rgba();

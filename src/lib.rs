@@ -51,6 +51,9 @@ pub struct Cli {
     /// Seed the initial population with mutated copies of a saved champion's genome.
     #[arg(long)]
     pub load_genome: Option<PathBuf>,
+    /// Selection environment (obstacle layout + survival predicate).
+    #[arg(long, value_enum, default_value_t = Challenge::NorthBand)]
+    pub challenge: Challenge,
     /// Headless only: run 50 generations and print gens/sec, then exit.
     #[arg(long)]
     pub bench: bool,
@@ -65,6 +68,7 @@ impl Cli {
             mutation_rate: self.mutation_rate,
             steps_per_generation: self.steps,
             seed,
+            challenge: self.challenge,
         }
     }
 }
@@ -108,6 +112,112 @@ pub fn build_simulator(cli: &Cli) -> Simulator {
 /// reproduce. The barrier obstacle sits on this row.
 pub const SURVIVAL_Y: u32 = 108;
 
+/// A rectangle of obstacle cells: ((x0, y0), (x1, y1)), inclusive on both ends.
+type Rect = ((u32, u32), (u32, u32));
+
+/// The selection environment for a run. Each variant defines two things: the
+/// obstacle layout stamped into the 128x128 world at the start of every
+/// generation, and the survival predicate applied to each agent's final
+/// position. Both are pure functions of the generation number (or constant), so
+/// runs stay bit-for-bit reproducible. Selection reuses the existing positional
+/// mechanism — no energy, food, or per-step scoring is involved.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Challenge {
+    /// The original behavior: survive iff final `y > 108`, with a single solid
+    /// horizontal barrier spanning x∈[10,118] on row y=108. Trivial to solve
+    /// (evolution just learns "go north"); kept as the default so existing runs
+    /// are unchanged.
+    #[default]
+    NorthBand,
+    /// Survive iff the final position lies within radius 20 of any of the four
+    /// world corners. A 33x33 obstacle block fills the center (x,y∈[48,80]) to
+    /// discourage clumping and give the directional sensors something to read.
+    /// Selects for dispersal and a committed directional preference.
+    Corners,
+    /// Survive iff final `y > 108`, but the barrier on row y=108 spans the full
+    /// width x∈[0,127] with only three width-5 gaps (centered near x=24, 63,
+    /// 102). Agents starting below must locate and pass through a gap, so this
+    /// selects for real navigation off the directional obstacle sensors.
+    Gauntlet,
+    /// Survive iff the final `y` is within 10 of a band center that oscillates
+    /// with the generation number: `center = round(64 + 24*sin(0.25*gen))`,
+    /// giving a height-21 safe band whose midline sweeps y∈[40,88]. No
+    /// obstacles. The target moves between generations and agents have no
+    /// absolute-position sense, so a hardcoded "go north" fails; it selects for
+    /// robust centering strategies.
+    MovingBand,
+    /// Survive iff the final position is strictly inside a central walled box:
+    /// walls of thickness 1 form the square x,y∈[44,84] with a width-9 entrance
+    /// gap in the bottom wall (x∈[60,68], y=44). Safe interior is x,y∈[45,83].
+    /// Selects for seeking the box and threading the single entrance, using the
+    /// directional sensors to follow walls.
+    Enclosure,
+}
+
+impl Challenge {
+    /// Obstacle rectangles present in the world for `generation`.
+    fn obstacles(self, _generation: u32) -> Vec<Rect> {
+        match self {
+            Challenge::NorthBand => vec![((10, SURVIVAL_Y), (118, SURVIVAL_Y))],
+            Challenge::Corners => vec![((48, 48), (80, 80))],
+            Challenge::Gauntlet => {
+                // Full-width barrier on row SURVIVAL_Y with three gaps.
+                let y = SURVIVAL_Y;
+                let gaps = [(22u32, 26u32), (61, 65), (100, 104)];
+                let mut segs: Vec<Rect> = Vec::new();
+                let mut x = 0u32;
+                for (g0, g1) in gaps {
+                    if x < g0 {
+                        segs.push(((x, y), (g0 - 1, y)));
+                    }
+                    x = g1 + 1;
+                }
+                if x <= 127 {
+                    segs.push(((x, y), (127, y)));
+                }
+                segs
+            }
+            Challenge::MovingBand => vec![],
+            Challenge::Enclosure => vec![
+                ((44, 84), (84, 84)), // top wall
+                ((44, 44), (44, 84)), // left wall
+                ((84, 44), (84, 84)), // right wall
+                ((44, 44), (59, 44)), // bottom wall, left of entrance
+                ((69, 44), (84, 44)), // bottom wall, right of entrance
+            ],
+        }
+    }
+
+    /// Midline of the MovingBand safe zone at `generation` (deterministic).
+    fn moving_band_center(generation: u32) -> u32 {
+        (64.0 + 24.0 * (generation as f64 * 0.25).sin()).round() as u32
+    }
+
+    /// Does an agent ending at `pos` in `generation` survive?
+    fn survives(self, pos: (u32, u32), generation: u32) -> bool {
+        match self {
+            Challenge::NorthBand | Challenge::Gauntlet => pos.1 > SURVIVAL_Y,
+            Challenge::Corners => {
+                const R2: i32 = 20 * 20;
+                let corners = [(0i32, 0i32), (0, 127), (127, 0), (127, 127)];
+                corners.iter().any(|&(cx, cy)| {
+                    let dx = pos.0 as i32 - cx;
+                    let dy = pos.1 as i32 - cy;
+                    dx * dx + dy * dy <= R2
+                })
+            }
+            Challenge::MovingBand => {
+                let center = Challenge::moving_band_center(generation) as i32;
+                (pos.1 as i32 - center).abs() <= 10
+            }
+            Challenge::Enclosure => {
+                (45..=83).contains(&pos.0) && (45..=83).contains(&pos.1)
+            }
+        }
+    }
+}
+
 /// Number of random agent pairs sampled when measuring genome diversity.
 const DIVERSITY_SAMPLE_PAIRS: usize = 200;
 
@@ -122,6 +232,10 @@ pub struct SimConfig {
     pub mutation_rate: f32,
     pub steps_per_generation: u32,
     pub seed: u64,
+    /// Selection environment. Defaults to `NorthBand` when absent from an older
+    /// serialized champion, so those files still load.
+    #[serde(default)]
+    pub challenge: Challenge,
 }
 
 /// A saved champion: the best agent's genome plus the config that produced it.
@@ -180,7 +294,9 @@ pub struct Simulator {
     current_steps: u32,
     config: SimConfig,
     move_vectors: Vec<(i32, i32)>,
-    obstacles: Vec<((u32, u32), (u32, u32))>,
+    /// Obstacle rectangles currently stamped into the world (recomputed from the
+    /// challenge each generation). Exposed so the viewer can render walls.
+    pub obstacles: Vec<Rect>,
     master_rng: ChaCha8Rng,
     gen_start: Instant,
     /// Optional genome to seed the initial population from (mutated copies).
@@ -208,8 +324,8 @@ impl Simulator {
                 (-1, 1),
                 (-1, -1),
             ],
-            // Single horizontal barrier on the survival row, derived from SURVIVAL_Y.
-            obstacles: vec![((10, SURVIVAL_Y), (118, SURVIVAL_Y))],
+            // Obstacle layout for generation 0, per the configured challenge.
+            obstacles: config.challenge.obstacles(0),
             master_rng,
             gen_start: Instant::now(),
             seed_genome: None,
@@ -275,8 +391,9 @@ impl Simulator {
         // Record metrics / champion for the generation that just finished.
         self.record_generation();
 
+        let lived_gen = self.generation;
         self.generation += 1;
-        self.remove_losers();
+        self.remove_losers(lived_gen);
 
         // Extinction: no survivors means there is nothing to reproduce from.
         // Reseed the generation with fresh random genomes instead of crashing
@@ -345,8 +462,12 @@ impl Simulator {
         (self.world[coords.0 as usize] >> coords.1) & 1 == 1
     }
 
-    fn remove_losers(&mut self) {
-        self.agents.retain(|a| a.get_pos().1 > SURVIVAL_Y);
+    /// Cull agents that failed the survival predicate for the generation they
+    /// just lived through (`lived_gen`), then reset the world with obstacles for
+    /// the upcoming generation.
+    fn remove_losers(&mut self, lived_gen: u32) {
+        let challenge = self.config.challenge;
+        self.agents.retain(|a| challenge.survives(a.get_pos(), lived_gen));
         self.clear_world();
     }
 
@@ -445,15 +566,19 @@ impl Simulator {
         inputs
     }
 
+    /// Recompute the challenge's obstacle layout for the current generation and
+    /// stamp it into the world.
     fn add_obstacles(&mut self) {
-        for obstacle in &self.obstacles {
+        let obstacles = self.config.challenge.obstacles(self.generation);
+        for obstacle in &obstacles {
             let mut mask = 0u128;
-            (obstacle.0.1..=obstacle.1.1).for_each(|x| mask += 2_u128.pow(x));
+            (obstacle.0.1..=obstacle.1.1).for_each(|y| mask |= 1u128 << y);
 
             for x in obstacle.0.0..=obstacle.1.0 {
                 self.world[x as usize] |= mask;
             }
         }
+        self.obstacles = obstacles;
     }
 
     /// Compute + emit metrics for the just-finished generation, and save the
@@ -463,10 +588,12 @@ impl Simulator {
         let wall_ms = self.gen_start.elapsed().as_secs_f64() * 1000.0;
         let n = self.agents.len();
 
+        let challenge = self.config.challenge;
+        let cur_gen = self.generation;
         let survivors = self
             .agents
             .iter()
-            .filter(|a| a.get_pos().1 > SURVIVAL_Y)
+            .filter(|a| challenge.survives(a.get_pos(), cur_gen))
             .count() as u32;
         let max_final_y = self.agents.iter().map(|a| a.get_pos().1).max().unwrap_or(0);
         let sum_y: u64 = self.agents.iter().map(|a| a.get_pos().1 as u64).sum();
@@ -591,7 +718,84 @@ mod tests {
             mutation_rate: 0.001,
             steps_per_generation: 50,
             seed,
+            challenge: Challenge::NorthBand,
         }
+    }
+
+    /// A world with the given challenge's obstacles stamped in, used to check
+    /// obstacle cells are marked occupied.
+    fn world_for(challenge: Challenge) -> Simulator {
+        let mut cfg = test_config(1);
+        cfg.challenge = challenge;
+        let mut sim = Simulator::new(cfg);
+        sim.add_obstacles();
+        sim
+    }
+
+    #[test]
+    fn challenge_predicates_and_layouts_are_consistent() {
+        // For each challenge: a point in the safe zone survives, a point outside
+        // does not, and every obstacle cell is marked occupied in the world.
+        // (challenge, inside/survives, outside/dies)
+        type Case = (Challenge, (u32, u32), (u32, u32));
+        let cases: &[Case] = &[
+            (Challenge::NorthBand, (64, 120), (64, 50)),
+            (Challenge::Corners, (2, 2), (64, 64)),
+            (Challenge::Gauntlet, (64, 120), (64, 50)),
+            (Challenge::MovingBand, (64, Challenge::moving_band_center(0)), (64, 5)),
+            (Challenge::Enclosure, (64, 64), (5, 5)),
+        ];
+        for &(challenge, inside, outside) in cases {
+            assert!(
+                challenge.survives(inside, 0),
+                "{challenge:?}: safe-zone point {inside:?} should survive"
+            );
+            assert!(
+                !challenge.survives(outside, 0),
+                "{challenge:?}: outside point {outside:?} should not survive"
+            );
+            let sim = world_for(challenge);
+            for ((x0, y0), (x1, y1)) in challenge.obstacles(0) {
+                for x in x0..=x1 {
+                    for y in y0..=y1 {
+                        assert!(
+                            sim.get_pos((x, y)),
+                            "{challenge:?}: obstacle cell ({x},{y}) not occupied"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gauntlet_gaps_are_open_and_barrier_blocks() {
+        // The three gap centers on the barrier row are passable; a between-gap
+        // cell is solid. This is what forces navigation.
+        let sim = world_for(Challenge::Gauntlet);
+        for gap_x in [24u32, 63, 102] {
+            assert!(!sim.get_pos((gap_x, SURVIVAL_Y)), "gap at x={gap_x} is blocked");
+        }
+        assert!(sim.get_pos((10, SURVIVAL_Y)), "barrier between gaps should be solid");
+    }
+
+    #[test]
+    fn enclosure_entrance_is_open() {
+        // The bottom-wall entrance gap is passable; the rest of the bottom wall
+        // is solid, so agents must thread the single opening.
+        let sim = world_for(Challenge::Enclosure);
+        assert!(!sim.get_pos((64, 44)), "entrance cell should be open");
+        assert!(sim.get_pos((50, 44)), "bottom wall beside entrance should be solid");
+    }
+
+    #[test]
+    fn moving_band_center_tracks_generation() {
+        // The band midline is a deterministic, non-constant function of the
+        // generation (so "go north" can't be hardcoded).
+        let c0 = Challenge::moving_band_center(0);
+        let c_shifted = Challenge::moving_band_center(6);
+        assert_eq!(c0, 64, "gen-0 band should be centered");
+        assert_ne!(c0, c_shifted, "band center should move across generations");
     }
 
     #[test]
@@ -620,6 +824,35 @@ mod tests {
                 assert!(seen.insert(a.get_pos()), "two agents on one cell after step");
             }
         }
+    }
+
+    #[test]
+    fn directional_sensors_respond_to_walls() {
+        // Sensor id 9 maps to move_vectors[2] = (1, 0) (east neighbor). It reads
+        // 1.0 in open space and 0.0 when a wall (or agent) occupies that cell —
+        // confirming the directional obstacle sensors fire near walls, which is
+        // what Gauntlet/Enclosure rely on for navigation.
+        let move_vectors = vec![
+            (0, 1),
+            (0, -1),
+            (1, 0),
+            (1, 1),
+            (1, -1),
+            (-1, 0),
+            (-1, 1),
+            (-1, -1),
+        ];
+        let base = vec![0.0f32; 7];
+        let pos = (64u32, 64u32);
+
+        let open = vec![0u128; 128];
+        let inputs = calc_positional_inputs(&open, &move_vectors, pos, &base, vec![9]);
+        assert_eq!(inputs[9], 1.0, "east sensor should read 1.0 in open space");
+
+        let mut walled = vec![0u128; 128];
+        walled[65] |= 1u128 << 64; // wall at (65, 64), the east neighbor
+        let inputs = calc_positional_inputs(&walled, &move_vectors, pos, &base, vec![9]);
+        assert_eq!(inputs[9], 0.0, "east sensor should read 0.0 against a wall");
     }
 
     #[test]

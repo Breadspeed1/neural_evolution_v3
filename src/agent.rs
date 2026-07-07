@@ -208,6 +208,21 @@ impl Brain {
         out
     }
 
+    /// Read-only view of the decoded connections (for the viewer's brain
+    /// inspector on any trophic layer that reuses this brain, e.g. the eco
+    /// herbivores). Crate-internal because `Connection` layout is an
+    /// implementation detail exposed only through the sim's data accessors.
+    pub(crate) fn connections(&self) -> &[Connection] {
+        &self.connections
+    }
+
+    /// Read-only view of the last neuron activations, indexed `[layer][id]`
+    /// (layer 0 = inputs, 1 = inner, 2 = outputs). Valid after a `step`; read
+    /// live by the signal-flow inspector.
+    pub(crate) fn neurons(&self) -> &[Vec<f32>] {
+        &self.neurons
+    }
+
     pub(crate) fn step(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
         self.reset_all();
         self.neurons[0] = input;

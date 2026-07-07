@@ -42,7 +42,7 @@
 //! stochastic step — seeding — draws from a `ChaCha8Rng` seeded deterministically
 //! from `(seed, tick, cell-index)`, so two same-seed runs are bit-identical.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -54,7 +54,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::Position;
-use crate::agent::{Brain, mutate_genome};
+use crate::agent::{Brain, Connection, mutate_genome};
 use crate::grid::{Cell, Grid};
 
 /// Herbivore sensor layout — the forager sensorium fed to the reused
@@ -77,6 +77,13 @@ use crate::grid::{Cell, Grid};
 /// |  10 | blocked_w   | 1.0 if the −x neighbor is off-grid or occupied              |
 /// |  11 | density     | occupied fraction of the 8-neighborhood (herbivore crowding) |
 const HERB_INPUTS: usize = 12;
+
+/// How many distinct lineages the dynasty record keeps per interval (the top-N
+/// by current population); the remainder folds into an "other" bucket the viewer
+/// derives. Bounds the per-record size so the metrics history stays small and
+/// the JSONL deterministic. Twelve golden-ratio hues stay distinguishable in the
+/// bloodlines strip while capturing the reigning dynasties.
+const TOP_LINEAGES: usize = 12;
 
 /// A herbivore: the first mobile trophic level and the project's first
 /// generation-less birth/death evolver. Bundled as one hecs component (mirroring
@@ -102,6 +109,9 @@ pub(crate) struct Herbivore {
 /// `order` sequence (keeps the render code off the ECS internals, like the
 /// challenge sim's `AgentView`).
 pub struct HerbView {
+    /// The hecs entity id — stable across ticks, so the viewer selects/tracks a
+    /// protagonist by this (an `order` index shifts as neighbors die).
+    pub entity: Entity,
     pub pos: (u32, u32),
     pub lineage: u32,
     /// Energy as a 0..1 fraction of `energy_max` (drives brightness).
@@ -276,6 +286,13 @@ pub struct EcoMetrics {
     pub deaths: u64,
     /// Mean herbivore energy (0.0 when the population is empty).
     pub mean_energy: f64,
+    /// The dynasty snapshot: the top-[`TOP_LINEAGES`] lineages by current
+    /// population as `(lineage_id, count)` pairs, ordered by count descending
+    /// (ties broken by ascending lineage id, so it is fully deterministic). The
+    /// rest of the population folds into an "other" bucket the viewer derives as
+    /// `population - Σ count`. Drives the bloodlines strip; `Σ count + other`
+    /// always equals `population`.
+    pub lineage_counts: Vec<(u32, u32)>,
 }
 
 /// Derive a deterministic per-cell seed for the stochastic seeding draw, in the
@@ -525,6 +542,12 @@ impl EcoSim {
     #[inline]
     fn herb_energy(&self, e: Entity) -> f32 {
         self.ecs.get::<&Herbivore>(e).expect("herbivore has Herbivore").energy
+    }
+
+    /// Read a herbivore's lineage id.
+    #[inline]
+    fn herb_lineage(&self, e: Entity) -> u32 {
+        self.ecs.get::<&Herbivore>(e).expect("herbivore has Herbivore").lineage
     }
 
     /// Build the herbivore's sensor input vector at `pos` (see [`HERB_INPUTS`]
@@ -848,6 +871,18 @@ impl EcoSim {
         let total_energy: f64 = self.order.iter().map(|&e| self.herb_energy(e) as f64).sum();
         let mean_energy = if population > 0 { total_energy / population as f64 } else { 0.0 };
 
+        // Dynasty snapshot: count live herbivores per lineage, keep the top-N by
+        // count. A BTreeMap tally + a total-order sort make it order-independent
+        // and byte-identical across same-seed runs (the determinism gate). The
+        // remainder folds into "other" at display time.
+        let mut tally: BTreeMap<u32, u32> = BTreeMap::new();
+        for &e in &self.order {
+            *tally.entry(self.herb_lineage(e)).or_insert(0) += 1;
+        }
+        let mut lineage_counts: Vec<(u32, u32)> = tally.into_iter().collect();
+        lineage_counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        lineage_counts.truncate(TOP_LINEAGES);
+
         let m = EcoMetrics {
             tick: self.tick,
             total_biomass,
@@ -857,6 +892,7 @@ impl EcoSim {
             births: self.births_accum,
             deaths: self.deaths_accum,
             mean_energy,
+            lineage_counts,
         };
         // Births/deaths are reported per recording interval, so reset the running
         // counters once folded into a record.
@@ -912,13 +948,28 @@ impl EcoSim {
             .map(|&e| {
                 let pos = self.herb_pos(e);
                 let hb = self.ecs.get::<&Herbivore>(e).expect("herbivore exists");
-                HerbView { pos, lineage: hb.lineage, energy_frac: (hb.energy / emax).clamp(0.0, 1.0) }
+                HerbView { entity: e, pos, lineage: hb.lineage, energy_frac: (hb.energy / emax).clamp(0.0, 1.0) }
             })
             .collect()
     }
 
+    /// The brain wiring of one herbivore (for the inspector's signal-flow
+    /// diagram), copied out so the viewer holds no ECS borrow. `None` if the
+    /// entity has despawned. Read only on (re)selection, so the clone is cheap.
+    pub fn herb_connections(&self, e: Entity) -> Option<Vec<Connection>> {
+        self.ecs.get::<&Herbivore>(e).ok().map(|hb| hb.brain.connections().to_vec())
+    }
+
+    /// The live neuron activations of one herbivore, indexed `[layer][id]`
+    /// (0 = the 12 forager inputs, 1 = inner, 2 = the 5 movement outputs),
+    /// copied out so the viewer holds no ECS borrow. Read every frame for the
+    /// spotlighted creature; `None` if it despawned.
+    pub fn herb_neurons(&self, e: Entity) -> Option<Vec<Vec<f32>>> {
+        self.ecs.get::<&Herbivore>(e).ok().map(|hb| hb.brain.neurons().to_vec())
+    }
+
     /// Every recorded tick's metrics (drives the viewer's biomass/coverage
-    /// sparklines and the headless coverage summary).
+    /// sparklines, the bloodlines strip, and the headless coverage summary).
     pub fn metrics_history(&self) -> &[EcoMetrics] {
         &self.history
     }
@@ -946,8 +997,22 @@ impl EcoSim {
     /// hatch for the rung-2 unit tests, mirroring `set_cell`.
     #[cfg(test)]
     fn test_spawn_herbivore(&mut self, x: u32, y: u32, genome: Vec<u32>, energy: f32) -> Entity {
+        self.test_spawn_lineage(x, y, genome, energy, 0)
+    }
+
+    /// As [`test_spawn_herbivore`] but with an explicit lineage id, for the
+    /// lineage-count / dynasty tests that need several distinct bloodlines.
+    #[cfg(test)]
+    fn test_spawn_lineage(
+        &mut self,
+        x: u32,
+        y: u32,
+        genome: Vec<u32>,
+        energy: f32,
+        lineage: u32,
+    ) -> Entity {
         let amt = self.config.params.herb_inner_neurons;
-        let e = self.spawn_herbivore((x, y), genome, energy, 0, amt);
+        let e = self.spawn_herbivore((x, y), genome, energy, lineage, amt);
         self.order.push(e);
         e
     }
@@ -1264,5 +1329,62 @@ mod tests {
         let b = run();
         assert!(a.0 == b.0, "fields diverged under an identical seed");
         assert!(a.1 == b.1, "herbivore metrics diverged under an identical seed");
+    }
+
+    #[test]
+    fn lineage_counts_are_a_top_n_partition_of_population() {
+        // Hand-build a dynasty distribution: three fat lineages plus 15 distinct
+        // singletons (18 lineages, above TOP_LINEAGES=12). The record keeps the
+        // top-N by count (fat ones first), and Σkept + other == population.
+        let build = || {
+            let mut c = cfg(11, 32, 32);
+            c.params.init_herbivores = 0; // only the hand-placed herbivores
+            let mut sim = EcoSim::new(c);
+            for x in 0..5 {
+                sim.test_spawn_lineage(x, 0, vec![], 1.0, 100);
+            }
+            for x in 0..4 {
+                sim.test_spawn_lineage(x, 1, vec![], 1.0, 101);
+            }
+            for x in 0..3 {
+                sim.test_spawn_lineage(x, 2, vec![], 1.0, 102);
+            }
+            for k in 0..15u32 {
+                sim.test_spawn_lineage(k, 3, vec![], 1.0, 200 + k);
+            }
+            sim.record_metrics();
+            sim
+        };
+
+        let sim = build();
+        let m = sim.latest().unwrap();
+        let population = m.population;
+        assert_eq!(population, 27);
+        let lc = &m.lineage_counts;
+
+        // Capped to exactly the top-N, ordered by count descending.
+        assert_eq!(lc.len(), TOP_LINEAGES, "record must keep exactly the top-N");
+        assert!(lc.windows(2).all(|w| w[0].1 >= w[1].1), "not sorted by count desc");
+        // The three fat dynasties lead, in the right order.
+        assert_eq!(lc[0], (100, 5));
+        assert_eq!(lc[1], (101, 4));
+        assert_eq!(lc[2], (102, 3));
+        // Partition: Σkept + other == population; kept are the largest counts, so
+        // no dropped lineage (all singletons here) exceeds the smallest kept.
+        let kept: u64 = lc.iter().map(|&(_, n)| n as u64).sum();
+        let other = population - kept;
+        assert_eq!(kept + other, population, "counts + other must partition population");
+        assert_eq!(kept, 21, "5+4+3 fat + 9 kept singletons");
+        assert_eq!(other, 6, "6 singletons fall into other");
+        let kept_min = lc.iter().map(|&(_, n)| n).min().unwrap();
+        assert!(kept_min >= 1, "a dropped singleton cannot outrank a kept lineage");
+
+        // Deterministic: an identical rebuild yields byte-identical counts.
+        let sim2 = build();
+        assert_eq!(
+            sim2.latest().unwrap().lineage_counts,
+            m.lineage_counts,
+            "lineage-count record is not deterministic"
+        );
     }
 }

@@ -616,6 +616,8 @@ impl Simulator {
     5: ns population gradient
     6: ew population gradient
     7-14: can move in x direction
+    15: self x (normalized, 0..1)
+    16: self y (normalized, 0..1)
     */
     fn calc_step_inputs(&mut self) -> Vec<f32> {
         let mut inputs: Vec<f32> = vec![0.0; 7];
@@ -760,8 +762,9 @@ fn world_get(world: &[u128], coords: (u32, u32)) -> bool {
     (world[coords.0 as usize] >> coords.1) & 1 == 1
 }
 
-/// Build an agent's full input vector: the shared base inputs plus the 8
-/// directional "can I move here" sensors, read against a world snapshot.
+/// Build an agent's full input vector: the shared base inputs (7), the 8
+/// directional "can I move here" sensors, and the 2 self-position sensors,
+/// read against a world snapshot. Total width 17.
 fn calc_positional_inputs(
     world: &[u128],
     move_vectors: &[(i32, i32)],
@@ -770,9 +773,17 @@ fn calc_positional_inputs(
     used: Vec<usize>,
 ) -> Vec<f32> {
     let mut copy = base.to_vec();
-    copy.extend_from_slice(&[0.0; 8]);
+    copy.extend_from_slice(&[0.0; 10]);
 
+    // Obstacle sensors 7..=14 are computed lazily — only for the ids the brain
+    // actually reads (`used`). The position sensors 15/16 can also appear in
+    // `used`; they are filled unconditionally below, so skip them (and anything
+    // else out of the directional range) here to keep the move_vectors index in
+    // bounds.
     for i in used {
+        if !(7..=14).contains(&i) {
+            continue;
+        }
         let vec: (i32, i32) = move_vectors[i - 7];
         let neighbor = (
             (pos.0 as i32 + vec.0).clamp(0, 127) as u32,
@@ -780,6 +791,12 @@ fn calc_positional_inputs(
         );
         copy[i] = if world_get(world, neighbor) { 0.0 } else { 1.0 };
     }
+
+    // Self-position sensors, always populated (position is always "used", unlike
+    // the lazy obstacle sensors): normalized (x, y) so a brain can navigate to
+    // absolute coordinates rather than only follow the crowd or walls.
+    copy[15] = pos.0 as f32 / 127.0;
+    copy[16] = pos.1 as f32 / 127.0;
 
     copy
 }
@@ -1054,5 +1071,22 @@ mod tests {
         let pa: Vec<_> = a.agents.iter().map(|x| x.get_pos()).collect();
         let pb: Vec<_> = b.agents.iter().map(|x| x.get_pos()).collect();
         assert_ne!(pa, pb, "different seeds produced identical state");
+    }
+
+    #[test]
+    fn position_sensors_report_normalized_pos() {
+        // Widening added inputs 15/16 = self (x, y) / 127, filled unconditionally
+        // (independent of `used`). The eight obstacle sensors (ids 7..=14) are
+        // unaffected and still keyed off `used`.
+        let move_vectors = vec![
+            (0, 1), (0, -1), (1, 0), (1, 1), (1, -1), (-1, 0), (-1, 1), (-1, -1),
+        ];
+        let base = vec![0.0f32; 7];
+        let world = vec![0u128; 128];
+        let pos = (32u32, 96u32);
+        let inputs = calc_positional_inputs(&world, &move_vectors, pos, &base, vec![]);
+        assert_eq!(inputs.len(), 17, "input vector should be widened to 17");
+        assert_eq!(inputs[15], 32.0 / 127.0, "input 15 = self x / 127");
+        assert_eq!(inputs[16], 96.0 / 127.0, "input 16 = self y / 127");
     }
 }

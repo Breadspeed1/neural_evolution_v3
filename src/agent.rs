@@ -47,7 +47,7 @@ impl Agent {
     }
 
     /// Read-only view of the brain's last neuron activations, indexed
-    /// `[layer][id]` with layer 0 = inputs (15), 1 = inner, 2 = outputs (5).
+    /// `[layer][id]` with layer 0 = inputs (17), 1 = inner, 2 = outputs (5).
     pub fn brain_neurons(&self) -> &[Vec<f32>] {
         &self.brain.neurons
     }
@@ -162,7 +162,7 @@ impl Brain {
             used_input_ids: Vec::new(),
             connections: Vec::new(),
             neurons: vec![
-                vec![0.0; 15],
+                vec![0.0; 17],
                 vec![0.0; amt_inners as usize],
                 vec![0.0; 5]
             ],
@@ -327,7 +327,7 @@ mod tests {
     fn gene_decodes_to_expected_connection() {
         // Packing (bit 0 = LSB): [source_type:1][source_id:6][sink_type:1]
         // [sink_id:8][sign:1][weight:15].
-        let dec: u32 = (5 << 1)                  // source_id = 5  (5 % 15 = 5)
+        let dec: u32 = (5 << 1)                  // source_id = 5  (5 % 17 = 5)
             | (1 << 7)               // sink_type raw = 1 -> decoded 2 (output, len 5)
             | (3 << 8)               // sink_id = 3   (3 % 5 = 3)
             | (1 << 16)              // sign = 1 -> positive

@@ -327,6 +327,11 @@ pub struct Simulator {
     history: Vec<GenerationMetrics>,
     champion_path: Option<PathBuf>,
     champion_interval: u32,
+    /// The previous generation's final state: each agent's last position paired
+    /// with whether it survived, captured at turnover *before* the losers are
+    /// culled and the next generation spawns. Purely for the viewer's turnover
+    /// pulse; does not affect the sim or determinism.
+    last_final: Vec<((u32, u32), bool)>,
 }
 
 impl Simulator {
@@ -356,6 +361,7 @@ impl Simulator {
             history: Vec::new(),
             champion_path: None,
             champion_interval: 0,
+            last_final: Vec::new(),
             config,
         }
     }
@@ -386,6 +392,13 @@ impl Simulator {
     /// survival/diversity charts read from this.
     pub fn metrics_history(&self) -> &[GenerationMetrics] {
         &self.history
+    }
+
+    /// The previous generation's final `(position, survived)` pairs, captured at
+    /// turnover before culling. Empty until the first generation completes. The
+    /// viewer uses this to flash survivors/culled at their final positions.
+    pub fn last_final(&self) -> &[((u32, u32), bool)] {
+        &self.last_final
     }
 
     /// The active selection environment.
@@ -434,6 +447,16 @@ impl Simulator {
         self.record_generation();
 
         let lived_gen = self.generation;
+        // Snapshot final positions + survival before culling, for the viewer's
+        // turnover pulse. Cheap: one (u32,u32,bool) per agent, overwritten each
+        // generation. Independent of the RNG, so determinism is unaffected.
+        let challenge = self.config.challenge;
+        self.last_final.clear();
+        self.last_final.extend(
+            self.agents
+                .iter()
+                .map(|a| (a.get_pos(), challenge.survives(a.get_pos(), lived_gen))),
+        );
         self.generation += 1;
         self.remove_losers(lived_gen);
 

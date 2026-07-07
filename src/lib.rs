@@ -1020,10 +1020,17 @@ impl Simulator {
     /// stamp it into the world.
     fn add_obstacles(&mut self) {
         let obstacles = self.config.challenge.obstacles(self.generation);
+        let (w, h) = (self.grid.width, self.grid.height);
         for &((x0, y0), (x1, y1)) in &obstacles {
             for y in y0..=y1 {
                 for x in x0..=x1 {
-                    self.grid.set_obstacle((x, y));
+                    // Challenge coordinates assume a 128 grid. On a differently
+                    // sized (unadvertised) world, any off-grid obstacle cell is
+                    // skipped rather than panicking; at the default 128 every cell
+                    // is in bounds, so this guard is a no-op there.
+                    if (x as usize) < w && (y as usize) < h {
+                        self.grid.set_obstacle((x, y));
+                    }
                 }
             }
         }

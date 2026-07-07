@@ -82,7 +82,7 @@ impl Agent {
         let mut out: Vec<u32> = self.genome.clone();
 
         for i in 0..out.len() {
-            for j in 0..31 {
+            for j in 0..32 {
                 if rng.random_range(0..(1.0/mutation_rate) as i32) == 0 {
                     out[i] = binary_util::flip(&out[i], j)
                 }
@@ -124,7 +124,7 @@ impl Brain {
             used_input_ids: Vec::new(),
             connections: Vec::new(),
             neurons: vec![
-                vec![0.0; 14],
+                vec![0.0; 15],
                 vec![0.0; amt_inners as usize],
                 vec![0.0; 5]
             ],
@@ -150,7 +150,7 @@ impl Brain {
 
         if self.neurons[2][0] > self.move_activation {
             let mut rand = rand::rng();
-            request = (request.0 + rand.random_range(-1..1), request.1 + rand.random_range(-1..1));
+            request = (request.0 + rand.random_range(-1..=1), request.1 + rand.random_range(-1..=1));
         }
 
         let move_vec: Vec<(i32, i32)> = vec![
@@ -226,9 +226,9 @@ impl Brain {
             weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / -16000.0;
         }
 
-        if sink_type == 0 {
-            if sink_id > 6 {
-                self.used_input_ids.push(sink_id as usize);
+        if source_type == 0 && source_id > 6 {
+            if !self.used_input_ids.contains(&(source_id as usize)) {
+                self.used_input_ids.push(source_id as usize);
             }
         }
 

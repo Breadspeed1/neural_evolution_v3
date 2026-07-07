@@ -30,11 +30,25 @@ Every step in this roadmap obeys the inversion of that mistake:
 
 ## Where we are
 
+- **World model** *(rung 0 of the ecosystem ladder — the foundational refactor
+  that the layered-terrarium steps below build on)*: a **hybrid** substrate.
+  Creatures are **hecs entities** (a `Position` component + an `Agent` bundle of
+  brain/genome/lineage/…), and the spatial world is a **typed cell `Grid`**
+  (`Vec<Cell>`, each `Cell` an obstacle flag + `Option<Entity>` occupant),
+  replacing the old `Vec<u128>` occupancy bitmask. This lifts the hard 128×128
+  cap (grid width/height are parameters, still defaulting to 128, which the
+  challenge coordinates assume) and gives every cell room to grow per-cell state
+  (nutrient/biomass) for the energy and pheromone rungs — without touching the
+  agents. Determinism is unchanged: the Simulator keeps its own `order:
+  Vec<Entity>` in stable birth order (hecs archetype iteration is *not* stable
+  across despawns), and position in `order` is the per-agent RNG index exactly as
+  the old `Vec<Agent>` index was.
 - **Core sim**: parallel (rayon) step, seeded ChaCha8 determinism (reproducible
   across the parallel decision phase), geometric-skip mutation.
 - **Harness**: lib + headless/viewer bins, clap CLI, per-generation JSONL
   metrics (survival, mean/max final y, genome diversity), champion save/load,
-  `--bench` regression gate, unit tests incl. determinism.
+  `--bench` regression gate, unit tests incl. determinism and the grid/order
+  invariants.
 - **Challenges** (`--challenge`): the positional set `north-band` (default),
   `corners`, `gauntlet`, `moving-band`, `enclosure`, plus the pattern-forming set
   `flock`, `ring`, `heart`, `orbit` — each an obstacle layout + survival
@@ -64,6 +78,12 @@ These need no new mechanics — only selection pressure and the right readout:
   strip chart (stacked lineage share over generations).
 
 ## Roadmap (dependency-ordered; each step is a measurable gate)
+
+*Rung 0 (done): the hybrid world-model refactor above — hecs entities for
+creatures + a typed cell grid for the substrate — is the foundation the layered
+terrarium is built on. Steps 4 (energy/food) and 5 (pheromone field) are the ones
+that cash in its per-cell state and per-entity components; it was landed first, as
+a behavior-preserving swap, so those can be built cleanly.*
 
 ### 1. Viewer storytelling *(in progress)*
 The sim view shows 1000 equally-weighted dots — spectacle without story; the brain

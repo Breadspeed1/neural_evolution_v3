@@ -58,6 +58,10 @@ const OBSTACLE_PX: [u8; 4] = [56, 56, 53, 255]; // #383835
 const MARGIN: f32 = 14.0;
 /// How many recent positions each agent's motion trail retains.
 const TRAIL_LEN: usize = 18;
+/// In unlimited mode, record a trail sample at most every this-many sim steps,
+/// bounding the per-frame recording cost when thousands of steps run per frame
+/// (visual continuity is a normal-speed concern, not an unlimited-speed one).
+const UNLIMITED_TRAIL_STRIDE: u32 = 4;
 /// Turnover pulse duration (wall-clock, independent of sim speed).
 const PULSE_SECS: f32 = 0.5;
 
@@ -183,10 +187,21 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
         if !display || unlimited {
             // time-budgeted burst
             let budget = if display { DISPLAY_BUDGET } else { HEADLESS_BUDGET };
+            // Only sample trails when the world is shown, and only every kth
+            // step: unlimited mode runs thousands of steps per frame, so
+            // recording every one would be wasteful.
+            let mut since_record: u32 = 0;
             loop {
                 for _ in 0..64 {
                     simulator.step();
                     steps_this_frame += 1;
+                    if display {
+                        since_record += 1;
+                        if since_record >= UNLIMITED_TRAIL_STRIDE {
+                            since_record = 0;
+                            record_trails(&mut trails, &simulator.agents);
+                        }
+                    }
                 }
                 if frame_start.elapsed() >= budget {
                     break;
@@ -202,6 +217,9 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
             for _ in 0..(n as u64) {
                 simulator.step();
                 steps_this_frame += 1;
+                // One trail sample per executed sim step (not per frame), so
+                // trails stay continuous when several steps run per frame.
+                record_trails(&mut trails, &simulator.agents);
             }
         }
 
@@ -277,9 +295,9 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
                 set_selection(simulator, idx, &mut selected, &mut selected_gen, &mut graph);
             }
 
-            // Record one trail sample + heatmap sample per frame (correct across
-            // turnover, which was handled above, and cheap regardless of speed).
-            record_trails(&mut trails, &simulator.agents);
+            // Heatmap occupancy sample (trails are recorded per sim step, in the
+            // stepping loop above, so they stay continuous at multiple steps per
+            // frame).
             if heatmap {
                 accumulate_heat(&mut heat, &simulator.agents);
             }
@@ -784,17 +802,30 @@ fn draw_sparkline(
     let stroke = Color::new(hue.r, hue.g, hue.b, 0.95);
     let n = pts.len();
     let dx = if n > 1 { plot_w / (n - 1) as f32 } else { 0.0 };
+    let px_at = |i: usize| plot_x + i as f32 * dx;
 
-    // Fill under the curve.
-    for (i, &v) in pts.iter().enumerate() {
-        let px = plot_x + i as f32 * dx;
-        draw_line(px, map_y(v), px, baseline, dx.max(1.0), fill);
-    }
-    // Thin line on top.
-    for i in 1..n {
-        let x0 = plot_x + (i - 1) as f32 * dx;
-        let x1 = plot_x + i as f32 * dx;
-        draw_line(x0, map_y(pts[i - 1]), x1, map_y(pts[i]), 2.0, stroke);
+    if n == 1 {
+        // A single sample: a flat band across the plot at its value. Kept
+        // strictly inside the plot rect.
+        let vy = map_y(pts[0]);
+        draw_rectangle(plot_x, vy, plot_w, baseline - vy, fill);
+        draw_line(plot_x, vy, plot_x + plot_w, vy, 2.0, stroke);
+    } else {
+        // Fill under the curve as trapezoids between consecutive samples. This
+        // stays within [plot_x, plot_x + plot_w] at any point count; the old
+        // per-sample vertical line overhung its x by dx/2, which bled out of
+        // the panel (over the world view) when few, widely-spaced samples made
+        // dx large.
+        for i in 1..n {
+            let (x0, x1) = (px_at(i - 1), px_at(i));
+            let (y0, y1) = (map_y(pts[i - 1]), map_y(pts[i]));
+            draw_triangle(vec2(x0, y0), vec2(x1, y1), vec2(x1, baseline), fill);
+            draw_triangle(vec2(x0, y0), vec2(x1, baseline), vec2(x0, baseline), fill);
+        }
+        // Thin line on top.
+        for i in 1..n {
+            draw_line(px_at(i - 1), map_y(pts[i - 1]), px_at(i), map_y(pts[i]), 2.0, stroke);
+        }
     }
     // Faint baseline.
     draw_line(plot_x, baseline, plot_x + plot_w, baseline, 1.0, BASELINE);
@@ -811,11 +842,17 @@ fn draw_sparkline(
         draw_circle(px, map_y(mv), 2.6, TEXT_PRIMARY);
     }
 
-    // Min/max value labels.
+    // Min/max value labels, right-aligned inside the plot rect (a couple px off
+    // the right edge) so a wide auto-scaled value can't spill over the panel
+    // edge or the line.
     let hi_lbl = fmt.replace("{:.0}", &format!("{:.0}", hi * scale));
     let lo_lbl = fmt.replace("{:.0}", &format!("{:.0}", lo * scale));
-    draw_text(&hi_lbl, plot_x + plot_w - 44.0, plot_y + 12.0, 14.0, MUTED);
-    draw_text(&lo_lbl, plot_x + plot_w - 44.0, baseline - 2.0, 14.0, MUTED);
+    let right_label = |lbl: &str, ty: f32| {
+        let tw = measure_text(lbl, None, 14, 1.0).width;
+        draw_text(lbl, plot_x + plot_w - tw - 2.0, ty, 14.0, MUTED);
+    };
+    right_label(&hi_lbl, plot_y + 12.0);
+    right_label(&lo_lbl, baseline - 2.0);
 }
 
 /// Bucket-mean downsample of `values` to at most `target` points.

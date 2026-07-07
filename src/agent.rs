@@ -3,6 +3,12 @@ use rand_chacha::ChaCha8Rng;
 
 pub mod binary_util;
 
+/// Input-vector width of a challenge [`Agent`]'s brain (see the `INPUTS` comment
+/// in `lib.rs`). The [`Brain`] is width-parametric so other trophic layers (the
+/// eco herbivores) can reuse it with their own sensor count; this const pins the
+/// challenge agent's layout so its behavior is byte-identical to before.
+pub(crate) const AGENT_INPUTS: usize = 17;
+
 /// The per-creature component bundle: everything about an agent *except* its
 /// spatial position, which lives in a separate `Position` component (position is
 /// queried far more often than the brain, so keeping it a small standalone
@@ -46,7 +52,7 @@ impl Agent {
             genome: genome.to_vec(),
             lineage,
             accumulated_angle: 0.0,
-            brain: Brain::from(genome.to_vec(), amt_inners),
+            brain: Brain::from(genome.to_vec(), AGENT_INPUTS, amt_inners),
             rgba: Agent::calc_rgba(genome),
             amt_inners,
         }
@@ -149,7 +155,13 @@ pub fn mutate_genome(genome: &[u32], mutation_rate: f32, rng: &mut ChaCha8Rng) -
     out
 }
 
-struct Brain {
+/// A feed-forward brain decoded from the sparse connection genome. Width of the
+/// input layer is a construction parameter (`num_inputs`), so the challenge
+/// [`Agent`] (17 inputs) and the eco herbivores (their own forager sensorium)
+/// share the exact same decode/step machinery over different sensor counts. The
+/// genome decodes source/sink ids *modulo* each layer's length, so any width is
+/// valid. Kept `pub(crate)` so `crate::eco` can build one directly.
+pub(crate) struct Brain {
     genome: Vec<u32>,
     move_activation: f32,
     used_input_ids: Vec<usize>,
@@ -172,14 +184,14 @@ impl Clone for Brain {
 }
 
 impl Brain {
-    pub fn from(genome: Vec<u32>, amt_inners: u8) -> Brain {
+    pub(crate) fn from(genome: Vec<u32>, num_inputs: usize, amt_inners: u8) -> Brain {
         let mut out: Brain = Brain {
             genome,
             move_activation: 0.0,
             used_input_ids: Vec::new(),
             connections: Vec::new(),
             neurons: vec![
-                vec![0.0; 17],
+                vec![0.0; num_inputs],
                 vec![0.0; amt_inners as usize],
                 vec![0.0; 5]
             ],
@@ -196,7 +208,7 @@ impl Brain {
         out
     }
 
-    fn step(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
+    pub(crate) fn step(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
         self.reset_all();
         self.neurons[0] = input;
         self.calculate_all();
@@ -350,7 +362,7 @@ mod tests {
             | (1 << 16)              // sign = 1 -> positive
             | (16000u32 << 17);      // weight raw = 16000 -> 16000/16000 = 1.0
 
-        let brain = Brain::from(vec![dec], 10);
+        let brain = Brain::from(vec![dec], 17, 10);
         assert_eq!(brain.connections.len(), 1);
         let c = &brain.connections[0];
         assert_eq!(c.source_type, 0);

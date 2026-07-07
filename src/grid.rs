@@ -8,24 +8,26 @@
 //! rungs can grow `Cell` with nutrient/biomass fields without touching the
 //! agents. Row-major: cell `(x, y)` lives at `cells[y * width + x]`.
 //!
-//! Occupancy is a plain `bool` for now (rung 0, Part A). Part B upgrades it to
-//! `occupant: Option<Entity>` once agents become hecs entities, so a cell can
-//! say *which* creature stands on it — needed by later interaction mechanics.
+//! A cell's occupant is the hecs [`Entity`] standing on it (if any), so later
+//! interaction mechanics (predation, grazing) can ask *who* is in a cell — not
+//! just whether it is full. "Blocked" for collision is `obstacle || occupant`.
 
-/// One grid cell: a static obstacle flag plus a live-occupancy flag. "Blocked"
-/// for collision purposes means either — a wall or a creature both block
-/// movement onto the cell.
+use hecs::Entity;
+
+/// One grid cell: a static obstacle flag plus the creature currently on it (if
+/// any). "Blocked" for collision purposes means either — a wall or a creature
+/// both block movement onto the cell.
 #[derive(Clone, Default)]
 pub struct Cell {
     pub obstacle: bool,
-    pub occupied: bool,
+    pub occupant: Option<Entity>,
 }
 
 impl Cell {
     /// Whether movement onto this cell is blocked.
     #[inline]
     pub fn blocked(&self) -> bool {
-        self.obstacle || self.occupied
+        self.obstacle || self.occupant.is_some()
     }
 }
 
@@ -58,16 +60,16 @@ impl Grid {
         self.cells[self.idx(x, y)].blocked()
     }
 
-    /// Mark `pos` as occupied (a creature moved in / spawned there).
-    pub fn set_occupied(&mut self, (x, y): (u32, u32)) {
+    /// Mark `pos` as occupied by `entity` (a creature moved in / spawned there).
+    pub fn set_occupant(&mut self, (x, y): (u32, u32), entity: Entity) {
         let i = self.idx(x, y);
-        self.cells[i].occupied = true;
+        self.cells[i].occupant = Some(entity);
     }
 
-    /// Clear the occupancy of `pos` (a creature moved out / was culled).
-    pub fn clear_occupied(&mut self, (x, y): (u32, u32)) {
+    /// Clear the occupant of `pos` (a creature moved out / was culled).
+    pub fn clear_occupant(&mut self, (x, y): (u32, u32)) {
         let i = self.idx(x, y);
-        self.cells[i].occupied = false;
+        self.cells[i].occupant = None;
     }
 
     /// Stamp a static obstacle at `pos`.
@@ -81,7 +83,7 @@ impl Grid {
     pub fn reset(&mut self) {
         for c in &mut self.cells {
             c.obstacle = false;
-            c.occupied = false;
+            c.occupant = None;
         }
     }
 
@@ -110,10 +112,13 @@ mod tests {
         // transposed index would be caught.
         let mut g = Grid::new(10, 6);
         assert!(!g.blocked((3, 4)));
-        g.set_occupied((3, 4));
+        // Any Entity works; the grid only stores the id and reads is_some().
+        let mut w = hecs::World::new();
+        let e = w.spawn((1u8,));
+        g.set_occupant((3, 4), e);
         assert!(g.blocked((3, 4)), "cell should be occupied after set");
         assert!(!g.blocked((4, 3)), "the transposed cell must be independent");
-        g.clear_occupied((3, 4));
+        g.clear_occupant((3, 4));
         assert!(!g.blocked((3, 4)), "cell should be free after clear");
 
         g.set_obstacle((0, 0));

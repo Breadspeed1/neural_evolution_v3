@@ -8,6 +8,7 @@ default-run = "neural-evolution"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
+hecs = "0.11.0"
 macroquad = "0.4.15"
 rand = "0.10.2"
 rand_chacha = "0.10.0"

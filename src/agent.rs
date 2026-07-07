@@ -3,9 +3,13 @@ use rand_chacha::ChaCha8Rng;
 
 pub mod binary_util;
 
+/// The per-creature component bundle: everything about an agent *except* its
+/// spatial position, which lives in a separate `Position` component (position is
+/// queried far more often than the brain, so keeping it a small standalone
+/// component keeps the hot spatial queries cache-friendly). Held as one hecs
+/// component so the brain/genome move together.
 pub struct Agent {
     pub genome: Vec<u32>,
-    pub pos: (u32, u32),
     /// Lineage id: the index of this agent's founding ancestor at the initial
     /// generation (or extinction reseed). Inherited verbatim by children, so all
     /// descendants of one founder share an id. Used only for viewer coloring.
@@ -20,34 +24,38 @@ pub struct Agent {
     accumulated_angle: f32,
     brain: Brain,
     rgba: [u8; 4],
-    amt_inners: u8
+    amt_inners: u8,
 }
 
 impl Clone for Agent {
     fn clone(&self) -> Self {
         Agent {
-            pos: self.pos,
             genome: self.genome.clone(),
             lineage: self.lineage,
             accumulated_angle: self.accumulated_angle,
             brain: self.brain.clone(),
             rgba: self.get_rgba(),
-            amt_inners: self.amt_inners
+            amt_inners: self.amt_inners,
         }
     }
 }
 
 impl Agent {
-    pub fn new(genome: &[u32], amt_inners: u8, pos: (u32, u32), lineage: u32) -> Agent {
+    pub fn new(genome: &[u32], amt_inners: u8, lineage: u32) -> Agent {
         Agent {
-            pos,
             genome: genome.to_vec(),
             lineage,
             accumulated_angle: 0.0,
             brain: Brain::from(genome.to_vec(), amt_inners),
             rgba: Agent::calc_rgba(genome),
-            amt_inners
+            amt_inners,
         }
+    }
+
+    /// Number of inner neurons the brain was built with (needed to build a
+    /// child's brain at the same width).
+    pub fn amt_inners(&self) -> u8 {
+        self.amt_inners
     }
 
     /// Read-only view of the decoded brain connections (for the viewer's brain
@@ -60,14 +68,6 @@ impl Agent {
     /// `[layer][id]` with layer 0 = inputs (17), 1 = inner, 2 = outputs (5).
     pub fn brain_neurons(&self) -> &[Vec<f32>] {
         &self.brain.neurons
-    }
-
-    pub fn set_pos(&mut self, pos: (u32, u32)) {
-        self.pos = pos;
-    }
-
-    pub fn get_pos(&self) -> (u32, u32) {
-        self.pos
     }
 
     /// Signed angle (radians) accumulated around the grid center this
@@ -90,14 +90,9 @@ impl Agent {
         self.brain.step(input, rng)
     }
 
-    pub fn produce_child(&self, mutation_rate: f32, pos: (u32, u32), rng: &mut ChaCha8Rng) -> Agent {
+    pub fn produce_child(&self, mutation_rate: f32, rng: &mut ChaCha8Rng) -> Agent {
         let genome = mutate_genome(&self.genome, mutation_rate, rng);
-        Agent::new(
-            &genome,
-            self.amt_inners,
-            pos,
-            self.lineage
-        )
+        Agent::new(&genome, self.amt_inners, self.lineage)
     }
 
     pub fn get_rgba(&self) -> [u8; 4] {

@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use macroquad::prelude::*;
-use neural_evolution::agent::Agent;
-use neural_evolution::{Cli, Simulator, build_simulator};
+use neural_evolution::agent::Connection;
+use neural_evolution::{AgentView, Cli, Simulator, build_simulator};
 
 fn window_conf() -> Conf {
     Conf {
@@ -199,7 +199,7 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
                         since_record += 1;
                         if since_record >= UNLIMITED_TRAIL_STRIDE {
                             since_record = 0;
-                            record_trails(&mut trails, &simulator.agents);
+                            record_trails(&mut trails, &simulator.positions());
                         }
                     }
                 }
@@ -219,7 +219,7 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
                 steps_this_frame += 1;
                 // One trail sample per executed sim step (not per frame), so
                 // trails stay continuous when several steps run per frame.
-                record_trails(&mut trails, &simulator.agents);
+                record_trails(&mut trails, &simulator.positions());
             }
         }
 
@@ -264,17 +264,20 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
             clear_background(BG_PAGE);
 
             let world_size = screen_height();
+            // One render snapshot per frame (position + colors), in `order`
+            // sequence; every selection index and per-agent draw reads from it.
+            let views = simulator.agent_views();
 
             // (Re)build the challenge overlay only when the generation changes.
             if overlay_gen != Some(simulator.generation) {
                 build_overlay(simulator, &mut overlay);
                 overlay_gen = Some(simulator.generation);
                 // Agents were replaced on turnover: reselect via the heuristic.
-                let idx = best_agent(simulator);
+                let idx = best_agent(simulator, &views);
                 set_selection(simulator, idx, &mut selected, &mut selected_gen, &mut graph);
             }
             if selected.is_none() {
-                let idx = best_agent(simulator);
+                let idx = best_agent(simulator, &views);
                 set_selection(simulator, idx, &mut selected, &mut selected_gen, &mut graph);
             }
 
@@ -284,14 +287,14 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
                 if mx < world_size && my < world_size {
                     let cx = (mx / world_size * 128.0) as i32;
                     let cy = (my / world_size * 128.0) as i32;
-                    if let Some(idx) = nearest_agent(simulator, cx, cy, 4) {
+                    if let Some(idx) = nearest_agent(&views, cx, cy, 4) {
                         set_selection(simulator, Some(idx), &mut selected, &mut selected_gen, &mut graph);
                     }
                 }
             }
             // `b` reselects the heuristic "best" agent.
             if is_key_pressed(KeyCode::B) {
-                let idx = best_agent(simulator);
+                let idx = best_agent(simulator, &views);
                 set_selection(simulator, idx, &mut selected, &mut selected_gen, &mut graph);
             }
 
@@ -299,15 +302,15 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
             // stepping loop above, so they stay continuous at multiple steps per
             // frame).
             if heatmap {
-                accumulate_heat(&mut heat, &simulator.agents);
+                accumulate_heat(&mut heat, &simulator.positions());
             }
 
             draw_world(
-                simulator, &overlay, &heat, heatmap, color_mode, selected, &trails, pulse.as_ref(),
+                &views, &overlay, &heat, heatmap, color_mode, selected, &trails, pulse.as_ref(),
                 world_size, &mut frame_image, &texture,
             );
             draw_dashboard(
-                simulator, world_size, target_sps, unlimited, display, heatmap, color_mode,
+                simulator, &views, world_size, target_sps, unlimited, display, heatmap, color_mode,
                 selected, graph.as_ref(), fps_smooth, sps_smooth,
             );
         } else {
@@ -336,13 +339,12 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
 /// short trail rather than a stack of identical points. Trails are index-keyed
 /// and rebuilt whenever the population size changes (belt-and-suspenders with the
 /// explicit clear at turnover).
-fn record_trails(trails: &mut Vec<Vec<(u8, u8)>>, agents: &[Agent]) {
-    if trails.len() != agents.len() {
+fn record_trails(trails: &mut Vec<Vec<(u8, u8)>>, positions: &[(u32, u32)]) {
+    if trails.len() != positions.len() {
         trails.clear();
-        trails.resize(agents.len(), Vec::new());
+        trails.resize(positions.len(), Vec::new());
     }
-    for (i, a) in agents.iter().enumerate() {
-        let (x, y) = a.get_pos();
+    for (i, &(x, y)) in positions.iter().enumerate() {
         let p = (x as u8, y as u8);
         let t = &mut trails[i];
         if t.last() == Some(&p) {
@@ -356,9 +358,8 @@ fn record_trails(trails: &mut Vec<Vec<(u8, u8)>>, agents: &[Agent]) {
 }
 
 /// Accumulate one occupancy sample (current agent cells) into the heat grid.
-fn accumulate_heat(heat: &mut [u32], agents: &[Agent]) {
-    for a in agents {
-        let (x, y) = a.get_pos();
+fn accumulate_heat(heat: &mut [u32], positions: &[(u32, u32)]) {
+    for &(x, y) in positions {
         heat[(y * 128 + x) as usize] += 1;
     }
 }
@@ -367,20 +368,21 @@ fn accumulate_heat(heat: &mut [u32], agents: &[Agent]) {
 /// survival zone, breaking ties (and the no-survivor case) by highest `y`. This
 /// is exactly right for the band/gauntlet challenges (whose goal is high `y`)
 /// and picks a live winner for the others when one exists. Returns None only for
-/// an empty population.
-fn best_agent(sim: &Simulator) -> Option<usize> {
-    sim.agents
+/// an empty population. The returned index is a position in `order` (= `views`).
+fn best_agent(sim: &Simulator, views: &[AgentView]) -> Option<usize> {
+    views
         .iter()
         .enumerate()
-        .max_by_key(|(_, a)| (sim.is_safe(a.get_pos()) as u8, a.get_pos().1))
+        .max_by_key(|(_, v)| (sim.is_safe(v.pos) as u8, v.pos.1))
         .map(|(i, _)| i)
 }
 
 /// Nearest agent to cell (cx, cy) within `radius` cells (Chebyshev), if any.
-fn nearest_agent(sim: &Simulator, cx: i32, cy: i32, radius: i32) -> Option<usize> {
+/// Returns a position in `order` (= `views`).
+fn nearest_agent(views: &[AgentView], cx: i32, cy: i32, radius: i32) -> Option<usize> {
     let mut best: Option<(i32, usize)> = None;
-    for (i, a) in sim.agents.iter().enumerate() {
-        let (ax, ay) = a.get_pos();
+    for (i, v) in views.iter().enumerate() {
+        let (ax, ay) = v.pos;
         let d2 = (ax as i32 - cx).pow(2) + (ay as i32 - cy).pow(2);
         if d2 <= radius * radius && best.is_none_or(|(bd, _)| d2 < bd) {
             best = Some((d2, i));
@@ -389,7 +391,8 @@ fn nearest_agent(sim: &Simulator, cx: i32, cy: i32, radius: i32) -> Option<usize
     best.map(|(_, i)| i)
 }
 
-/// Assign the selection and rebuild the (cached) brain layout for it.
+/// Assign the selection and rebuild the (cached) brain layout for it. The
+/// selection index maps into `order`; the wiring is copied out of the ECS.
 fn set_selection(
     sim: &Simulator,
     idx: Option<usize>,
@@ -400,8 +403,9 @@ fn set_selection(
     *selected = idx;
     *selected_gen = sim.generation;
     *graph = idx
-        .and_then(|i| sim.agents.get(i))
-        .map(BrainGraph::build);
+        .and_then(|i| sim.order().get(i).copied())
+        .and_then(|e| sim.agent_connections(e))
+        .map(|conns| BrainGraph::build(&conns));
 }
 
 /// Build the 128x128 terrain overlay: survival zone tinted, obstacles solid,
@@ -433,7 +437,7 @@ fn blend_px(dst: [u8; 4], src: [u8; 3], a: f32) -> [u8; 4] {
 /// at the top-left, scaled up with nearest-neighbour filtering.
 #[allow(clippy::too_many_arguments)]
 fn draw_world(
-    sim: &Simulator,
+    views: &[AgentView],
     overlay: &[[u8; 4]],
     heat: &[u32],
     heatmap: bool,
@@ -479,8 +483,8 @@ fn draw_world(
         if trail.len() < 2 {
             continue;
         }
-        let Some(a) = sim.agents.get(i) else { continue };
-        let col = agent_color(a, color_mode);
+        let Some(v) = views.get(i) else { continue };
+        let col = agent_color(v, color_mode);
         let is_sel = selected == Some(i);
         let n = trail.len();
         for k in 1..n {
@@ -496,10 +500,10 @@ fn draw_world(
 
     // Agents: an oriented chevron along the last-move direction, or a dot if it
     // didn't move this frame.
-    for (i, a) in sim.agents.iter().enumerate() {
-        let (gx, gy) = a.get_pos();
+    for (i, v) in views.iter().enumerate() {
+        let (gx, gy) = v.pos;
         let (px, py) = (sx(gx as f32), sx(gy as f32));
-        let col = agent_color(a, color_mode);
+        let col = agent_color(v, color_mode);
         let dir = trails.get(i).and_then(|t| {
             (t.len() >= 2).then(|| {
                 let a = t[t.len() - 2];
@@ -526,9 +530,9 @@ fn draw_world(
 
     // Selection ring (bright, always legible on dark).
     if let Some(i) = selected
-        && let Some(a) = sim.agents.get(i)
+        && let Some(v) = views.get(i)
     {
-        let (x, y) = a.get_pos();
+        let (x, y) = v.pos;
         let r = cell * 3.0;
         draw_circle_lines(sx(x as f32), sx(y as f32), r, 2.0, Color::new(1.0, 1.0, 1.0, 0.95));
         draw_circle_lines(sx(x as f32), sx(y as f32), r + 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.35));
@@ -558,10 +562,10 @@ fn draw_world(
 /// the dark world. Both color modes route through the same HSL constraint: the
 /// hue carries the identity (genome-hash or lineage-hash), saturation/lightness
 /// are pinned into a vivid range.
-fn agent_color(agent: &Agent, mode: ColorMode) -> Color {
+fn agent_color(view: &AgentView, mode: ColorMode) -> Color {
     let hue = match mode {
-        ColorMode::Genome => rgb_to_hue(agent.get_rgba()),
-        ColorMode::Lineage => (agent.lineage as f32 * 0.618_034).fract(),
+        ColorMode::Genome => rgb_to_hue(view.rgba),
+        ColorMode::Lineage => (view.lineage as f32 * 0.618_034).fract(),
     };
     let (r, g, b) = hsl_to_rgb(hue, 0.75, 0.62);
     Color::new(r, g, b, 1.0)
@@ -623,6 +627,7 @@ fn draw_header(label: &str, x: f32, y: f32) {
 #[allow(clippy::too_many_arguments)]
 fn draw_dashboard(
     sim: &Simulator,
+    views: &[AgentView],
     world_size: f32,
     target_sps: f64,
     unlimited: bool,
@@ -647,7 +652,7 @@ fn draw_dashboard(
     draw_text(&hud, world_size - dim.width - 12.0, 20.0, 15.0, MUTED);
 
     let status_h = 176.0;
-    draw_status_panel(sim, col_x, y, col_w, status_h, target_sps, unlimited, display, heatmap, color_mode, selected);
+    draw_status_panel(sim, views, col_x, y, col_w, status_h, target_sps, unlimited, display, heatmap, color_mode, selected);
     y += status_h + MARGIN;
 
     let spark_h = 116.0;
@@ -680,6 +685,7 @@ fn draw_dashboard(
 #[allow(clippy::too_many_arguments)]
 fn draw_status_panel(
     sim: &Simulator,
+    views: &[AgentView],
     x: f32,
     y: f32,
     w: f32,
@@ -695,8 +701,8 @@ fn draw_status_panel(
     let pad = MARGIN;
     draw_header("status", x + pad, y + 22.0);
 
-    let pop = sim.agents.len();
-    let live_safe = sim.agents.iter().filter(|a| sim.is_safe(a.get_pos())).count();
+    let pop = views.len();
+    let live_safe = views.iter().filter(|v| sim.is_safe(v.pos)).count();
     let cur_pct = if pop > 0 { live_safe as f64 / pop as f64 * 100.0 } else { 0.0 };
     let hist = sim.metrics_history();
     let last = hist.last();
@@ -902,10 +908,9 @@ struct BrainGraph {
 
 impl BrainGraph {
     /// Prune to the subgraph that can influence an output (backward reachability
-    /// from the output layer), then cap to the top MAX_EDGES by |weight|.
-    fn build(agent: &Agent) -> BrainGraph {
-        let conns = agent.brain_connections();
-
+    /// from the output layer), then cap to the top MAX_EDGES by |weight|. Takes
+    /// the connections copied out of the ECS (the viewer holds no borrow).
+    fn build(conns: &[Connection]) -> BrainGraph {
         // reaches: inner nodes with a path forward to an output. Fixpoint over
         // connections (sink type 2 = output is terminal-true).
         let mut reaches: HashSet<u8> = HashSet::new();
@@ -978,15 +983,19 @@ fn draw_brain_panel(
         draw_text("(no agent selected)", x + pad, y + 50.0, 15.0, MUTED);
         return;
     };
-    let Some(agent) = sim.agents.get(idx) else {
+    let Some(&entity) = sim.order().get(idx) else {
+        draw_text("(selection lost)", x + pad, y + 50.0, 15.0, MUTED);
+        return;
+    };
+    let Some(lineage) = sim.agent_lineage(entity) else {
         draw_text("(selection lost)", x + pad, y + 50.0, 15.0, MUTED);
         return;
     };
 
     let subtitle = if g.active_total > g.edges.len() {
-        format!("lineage {}   ·   showing {}/{} edges", agent.lineage, g.edges.len(), g.active_total)
+        format!("lineage {}   ·   showing {}/{} edges", lineage, g.edges.len(), g.active_total)
     } else {
-        format!("lineage {}   ·   {} edges, {} inner", agent.lineage, g.edges.len(), g.inner_ids.len())
+        format!("lineage {}   ·   {} edges, {} inner", lineage, g.edges.len(), g.inner_ids.len())
     };
     draw_text(&subtitle, x + pad, y + 42.0, 14.0, MUTED);
 
@@ -999,7 +1008,10 @@ fn draw_brain_panel(
         return;
     }
 
-    let neurons = agent.brain_neurons();
+    // Live activations, copied out of the ECS (no borrow held during drawing).
+    let Some(neurons) = sim.agent_neurons(entity) else {
+        return;
+    };
     let x_in = gx + 46.0;
     let x_out = gx + gw - 46.0;
     let x_mid = (x_in + x_out) * 0.5;
@@ -1103,11 +1115,13 @@ mod tests {
         for _ in 0..50 {
             sim.step();
         }
-        let i = best_agent(&sim).unwrap();
-        let g = BrainGraph::build(&sim.agents[i]);
+        let views = sim.agent_views();
+        let i = best_agent(&sim, &views).unwrap();
+        let conns = sim.agent_connections(sim.order()[i]).unwrap();
+        let g = BrainGraph::build(&conns);
         assert!(g.edges.len() <= MAX_EDGES, "drawn edges exceed cap");
         assert!(
-            g.active_total <= sim.agents[i].brain_connections().len(),
+            g.active_total <= conns.len(),
             "pruned set should not exceed the full connection set"
         );
     }

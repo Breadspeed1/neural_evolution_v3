@@ -1,19 +1,39 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::Parser;
+use hecs::Entity;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{Agent, mutate_genome};
+use crate::agent::{Agent, Connection, mutate_genome};
 use crate::grid::Grid;
 
 pub mod agent;
 pub mod grid;
+
+/// A creature's grid position, kept as its own hecs component: spatial queries
+/// (the decision phase, centroids, survival) touch it every step, far more often
+/// than the brain, so it stays a small standalone component.
+#[derive(Clone, Copy)]
+pub struct Position {
+    pub x: u32,
+    pub y: u32,
+}
+
+/// A read-only per-agent snapshot for the viewer, materialized in stable `order`
+/// sequence. Keeps the render code off the ECS internals (and out of hecs borrow
+/// guards) on the hot crowd path — position plus the two color inputs.
+pub struct AgentView {
+    pub pos: (u32, u32),
+    pub rgba: [u8; 4],
+    pub lineage: u32,
+}
 
 /// Command-line configuration shared by both binaries (viewer + headless).
 /// Defaults reproduce the original hardcoded values.
@@ -440,7 +460,16 @@ pub struct Simulator {
     /// replaced the old `Vec<u128>` column bitmask. Private; the viewer builds
     /// its terrain overlay from `obstacles` + `is_safe`, never from raw cells.
     grid: Grid,
-    pub agents: Vec<Agent>,
+    /// Creatures live here as entities: a `Position` component + an `Agent`
+    /// bundle (brain/genome/...). hecs archetype iteration is *not* stable
+    /// across despawns, so all determinism-sensitive iteration goes through
+    /// `order` instead of querying the world directly.
+    ecs: hecs::World,
+    /// The stable birth-order of live creatures — the crown jewel of
+    /// determinism. Position in `order` is the per-agent RNG index (identical to
+    /// the old `Vec<Agent>` index): pushed on spawn, `retain`-culled so
+    /// survivors keep their relative order, children appended in parent order.
+    order: Vec<Entity>,
     pub generation: u32,
     current_steps: u32,
     config: SimConfig,
@@ -472,7 +501,8 @@ impl Simulator {
         let size = config.world_size as usize;
         Simulator {
             grid: Grid::new(size, size),
-            agents: Vec::new(),
+            ecs: hecs::World::new(),
+            order: Vec::new(),
             generation: 0,
             current_steps: 0,
             move_vectors: vec![
@@ -545,6 +575,96 @@ impl Simulator {
         self.config.challenge.survives(pos, self.generation)
     }
 
+    // ----- viewer-facing accessors (the viewer never touches the ECS) -----
+
+    /// The live creatures in stable birth order. A viewer selection index maps
+    /// into this slice; entry `order()[i]` is the entity for order position `i`.
+    pub fn order(&self) -> &[Entity] {
+        &self.order
+    }
+
+    /// Current agent positions in `order` sequence (for motion trails / heat).
+    pub fn positions(&self) -> Vec<(u32, u32)> {
+        self.order.iter().map(|&e| self.pos_of(e)).collect()
+    }
+
+    /// A render snapshot (position + colors) per agent, in `order` sequence.
+    pub fn agent_views(&self) -> Vec<AgentView> {
+        self.order
+            .iter()
+            .map(|&e| {
+                let pos = self.pos_of(e);
+                let a = self.ecs.get::<&Agent>(e).expect("live entity has Agent");
+                AgentView { pos, rgba: a.get_rgba(), lineage: a.lineage }
+            })
+            .collect()
+    }
+
+    /// The brain wiring of one entity (for the inspector's node-link diagram),
+    /// copied out so the viewer holds no ECS borrow. `None` if it despawned.
+    pub fn agent_connections(&self, e: Entity) -> Option<Vec<Connection>> {
+        self.ecs.get::<&Agent>(e).ok().map(|a| a.brain_connections().to_vec())
+    }
+
+    /// The live neuron activations of one entity (read every frame for the
+    /// selected agent), copied out so the viewer holds no ECS borrow.
+    pub fn agent_neurons(&self, e: Entity) -> Option<Vec<Vec<f32>>> {
+        self.ecs.get::<&Agent>(e).ok().map(|a| a.brain_neurons().to_vec())
+    }
+
+    /// The lineage id of one entity (for the brain panel subtitle).
+    pub fn agent_lineage(&self, e: Entity) -> Option<u32> {
+        self.ecs.get::<&Agent>(e).ok().map(|a| a.lineage)
+    }
+
+    // ----- internal ECS helpers -----
+
+    /// Position of a live entity. Panics if the entity has no `Position`, which
+    /// would be an internal bug (every creature is spawned with one).
+    #[inline]
+    fn pos_of(&self, e: Entity) -> (u32, u32) {
+        let p = self.ecs.get::<&Position>(e).expect("live entity has Position");
+        (p.x, p.y)
+    }
+
+    /// Overwrite a live entity's position component.
+    #[inline]
+    fn set_pos(&mut self, e: Entity, pos: (u32, u32)) {
+        let mut p = self.ecs.get::<&mut Position>(e).expect("live entity has Position");
+        p.x = pos.0;
+        p.y = pos.1;
+    }
+
+    /// Attach a fully-built `Agent` to a fresh entity at a reserved unique cell,
+    /// appending it to `order`. Used by the reproduction phase, whose children
+    /// are decoded in parallel; here only the position reservation (one master
+    /// RNG draw sequence) is serial. The entity is spawned with a placeholder
+    /// position first so `rand_pos` can record the real occupant id.
+    fn spawn_prebuilt(&mut self, agent: Agent) -> Entity {
+        let e = self.ecs.spawn((Position { x: 0, y: 0 },));
+        let pos = self.rand_pos(e);
+        self.ecs.insert_one(e, agent).expect("just-spawned entity exists");
+        self.set_pos(e, pos);
+        self.order.push(e);
+        e
+    }
+
+    /// Spawn one creature whose genome is drawn *after* its position, preserving
+    /// the original master-RNG interleaving (position draws, then genome draws)
+    /// for the serial initial-generation and extinction-reseed paths.
+    /// `make_genome` runs after `rand_pos`, receiving `self` so it can pull from
+    /// the master RNG (random founder) or a per-agent RNG (seeded from a loaded
+    /// champion) as the caller chooses.
+    fn spawn_drawn(&mut self, lineage: u32, make_genome: impl FnOnce(&mut Self) -> Vec<u32>) {
+        let e = self.ecs.spawn((Position { x: 0, y: 0 },));
+        let pos = self.rand_pos(e);
+        let genome = make_genome(self);
+        let agent = Agent::new(&genome, self.config.amount_inners as u8, lineage);
+        self.ecs.insert_one(e, agent).expect("just-spawned entity exists");
+        self.set_pos(e, pos);
+        self.order.push(e);
+    }
+
     fn random_genome(&mut self) -> Vec<u32> {
         (0..self.config.genome_length)
             .map(|_| self.master_rng.random::<u32>())
@@ -553,23 +673,27 @@ impl Simulator {
 
     pub fn generate_initial_generation(&mut self) {
         let seed_genome = self.seed_genome.clone();
+        let seed = self.config.seed;
+        let mutation_rate = self.config.mutation_rate;
         for i in 0..self.config.population {
-            let pos = self.rand_pos();
-            let genome = match &seed_genome {
+            // Lineage id = founder index at the initial generation. The genome is
+            // drawn *after* the position (inside `spawn_drawn`) to preserve the
+            // original master-RNG draw order.
+            match &seed_genome {
                 Some(g) => {
-                    let mut rng = ChaCha8Rng::seed_from_u64(agent_seed(
-                        self.config.seed,
-                        0,
-                        REPRO_TAG,
-                        i as usize,
-                    ));
-                    mutate_genome(g, self.config.mutation_rate, &mut rng)
+                    let g = g.clone();
+                    self.spawn_drawn(i, move |_s| {
+                        let mut rng = ChaCha8Rng::seed_from_u64(agent_seed(
+                            seed,
+                            0,
+                            REPRO_TAG,
+                            i as usize,
+                        ));
+                        mutate_genome(&g, mutation_rate, &mut rng)
+                    });
                 }
-                None => self.random_genome(),
-            };
-            // Lineage id = founder index at the initial generation.
-            self.agents
-                .push(Agent::new(&genome, self.config.amount_inners as u8, pos, i));
+                None => self.spawn_drawn(i, |s| s.random_genome()),
+            }
         }
         self.add_obstacles();
         self.gen_start = Instant::now();
@@ -580,7 +704,7 @@ impl Simulator {
         // Resolve survival once for the generation just finished — including the
         // dynamic challenges' whole-population context (flock's centroid, orbit's
         // per-agent swept angle) — and reuse the same flags for metrics, the
-        // viewer snapshot, and culling. Order matches `self.agents`.
+        // viewer snapshot, and culling. Order matches `self.order`.
         let survived = self.eval_survival(lived_gen);
 
         // Record metrics / champion for the generation that just finished.
@@ -590,67 +714,80 @@ impl Simulator {
         // turnover pulse. Cheap: one (u32,u32,bool) per agent, overwritten each
         // generation. Independent of the RNG, so determinism is unaffected.
         self.last_final.clear();
-        self.last_final.extend(
-            self.agents
-                .iter()
-                .zip(&survived)
-                .map(|(a, &s)| (a.get_pos(), s)),
-        );
+        let finals: Vec<((u32, u32), bool)> = self
+            .order
+            .iter()
+            .zip(&survived)
+            .map(|(&e, &s)| (self.pos_of(e), s))
+            .collect();
+        self.last_final = finals;
         self.generation += 1;
-        self.remove_losers(&survived);
+
+        // Cull the losers (survivors keep their relative order), then reset the
+        // grid to obstacles-only for the new generation.
+        self.cull_to_survivors(&survived);
 
         // Extinction: no survivors means there is nothing to reproduce from.
         // Reseed the generation with fresh random genomes instead of crashing
-        // on a modulo-by-zero.
-        if self.agents.is_empty() {
-            let mut new_generation: Vec<Agent> = Vec::new();
+        // on a modulo-by-zero. Serial (each genome pulls from the master RNG),
+        // position drawn before genome as in the initial generation.
+        if self.order.is_empty() {
             for i in 0..self.config.population {
-                let pos = self.rand_pos();
-                let genome = self.random_genome();
-                // Fresh founders on reseed: lineage id = index again.
-                new_generation.push(Agent::new(
-                    &genome,
-                    self.config.amount_inners as u8,
-                    pos,
-                    i,
-                ));
+                self.spawn_drawn(i, |s| s.random_genome());
             }
-            self.agents = new_generation;
             self.gen_start = Instant::now();
             return;
         }
 
-        // Reserve unique spawn positions serially (mutates the world), then
-        // produce the children (genome mutation + Brain decode) in parallel.
-        let positions: Vec<(u32, u32)> =
-            (0..self.config.population).map(|_| self.rand_pos()).collect();
-        let len = self.agents.len();
-        let mutation_rate = self.config.mutation_rate;
-        let seed = self.config.seed;
-        let generation = self.generation;
-        let parents = &self.agents;
-
-        let new_generation: Vec<Agent> = positions
-            .par_iter()
-            .enumerate()
-            .map(|(i, &pos)| {
-                let mut rng =
-                    ChaCha8Rng::seed_from_u64(agent_seed(seed, generation, REPRO_TAG, i));
-                parents[i % len].produce_child(mutation_rate, pos, &mut rng)
+        // Reproduce. Gather the survivors' parent templates (in `order`), decode
+        // the children in parallel (each keyed by its birth index `i`, exactly as
+        // the old `par_iter` over positions), then despawn the parents and spawn
+        // the children serially so the master-RNG position draws stay in order.
+        let len = self.order.len();
+        let parents: Vec<(Vec<u32>, u8, u32)> = self
+            .order
+            .iter()
+            .map(|&e| {
+                let a = self.ecs.get::<&Agent>(e).expect("survivor has Agent");
+                (a.genome.clone(), a.amt_inners(), a.lineage)
             })
             .collect();
 
-        self.agents = new_generation;
+        let mutation_rate = self.config.mutation_rate;
+        let seed = self.config.seed;
+        let generation = self.generation;
+        let amt_inners = self.config.amount_inners as u8;
+        let children: Vec<Agent> = (0..self.config.population)
+            .into_par_iter()
+            .map(|i| {
+                let (pgenome, _amt, lineage) = &parents[i as usize % len];
+                let mut rng =
+                    ChaCha8Rng::seed_from_u64(agent_seed(seed, generation, REPRO_TAG, i as usize));
+                let genome = mutate_genome(pgenome, mutation_rate, &mut rng);
+                Agent::new(&genome, amt_inners, *lineage)
+            })
+            .collect();
+
+        // The next generation is entirely the children; the survivors were only
+        // reproduction templates, so despawn them and rebuild `order`.
+        for &e in &self.order {
+            self.ecs.despawn(e).expect("despawning a parent template");
+        }
+        self.order.clear();
+        for child in children {
+            self.spawn_prebuilt(child);
+        }
         self.gen_start = Instant::now();
     }
 
-    /// Reserve a unique spawn cell: unoccupied AND outside the current
-    /// challenge's survival zone. Excluding the survival zone stops agents from
-    /// spawning on a free win — they must move to earn survival, so gen-0
-    /// numbers reflect behavior rather than lucky placement. Uses the master
-    /// seeded RNG (deterministic) and the survival predicate for the generation
-    /// the spawned agent will live through (`self.generation`).
-    fn rand_pos(&mut self) -> (u32, u32) {
+    /// Reserve a unique spawn cell for `occupant`: unoccupied AND outside the
+    /// current challenge's survival zone. Excluding the survival zone stops
+    /// agents from spawning on a free win — they must move to earn survival, so
+    /// gen-0 numbers reflect behavior rather than lucky placement. Uses the
+    /// master seeded RNG (deterministic) and the survival predicate for the
+    /// generation the spawned agent will live through (`self.generation`), and
+    /// records `occupant` in the reserved cell.
+    fn rand_pos(&mut self, occupant: Entity) -> (u32, u32) {
         let challenge = self.config.challenge;
         let generation = self.generation;
         let (max_x, max_y) = (self.grid.max_x() as u32, self.grid.max_y() as u32);
@@ -664,7 +801,7 @@ impl Simulator {
                 self.master_rng.random_range(0..=max_y),
             );
         }
-        self.grid.set_occupied(pos);
+        self.grid.set_occupant(pos, occupant);
         pos
     }
 
@@ -674,14 +811,21 @@ impl Simulator {
         self.grid.blocked(coords)
     }
 
-    /// Cull agents that failed survival this generation, using the precomputed
-    /// per-agent `survived` flags (aligned with `self.agents`), then reset the
-    /// world with obstacles for the upcoming generation. Taking the flags rather
-    /// than re-deriving them keeps the dynamic challenges (flock/orbit) evaluated
-    /// exactly once and consistent with the recorded metrics.
-    fn remove_losers(&mut self, survived: &[bool]) {
-        let mut keep = survived.iter();
-        self.agents.retain(|_| *keep.next().unwrap_or(&false));
+    /// Despawn the creatures whose `survived[i]` is false, keeping survivors in
+    /// their relative birth order — the determinism guarantee: `order` is
+    /// filtered in place (never swap-removed), so a survivor's RNG index (its
+    /// position in `order`) only ever decreases monotonically, matching the old
+    /// `Vec::retain`. Then reset the grid to obstacles for the next generation.
+    fn cull_to_survivors(&mut self, survived: &[bool]) {
+        let mut survivors = Vec::with_capacity(self.order.len());
+        for (&e, &s) in self.order.iter().zip(survived) {
+            if s {
+                survivors.push(e);
+            } else {
+                self.ecs.despawn(e).expect("culling a live entity");
+            }
+        }
+        self.order = survivors;
         self.clear_world();
     }
 
@@ -690,20 +834,20 @@ impl Simulator {
         self.add_obstacles();
     }
 
-    /// Per-agent survival flags for the just-finished generation, in
-    /// `self.agents` order. Static challenges defer to the pure `survives`
-    /// predicate; the dynamic ones resolve their whole-population context here,
-    /// once: `flock` against the crowd's final centroid, `orbit` against each
-    /// agent's accumulated swept angle plus final radius band.
+    /// Per-agent survival flags for the just-finished generation, in `self.order`
+    /// order. Static challenges defer to the pure `survives` predicate; the
+    /// dynamic ones resolve their whole-population context here, once: `flock`
+    /// against the crowd's final centroid, `orbit` against each agent's
+    /// accumulated swept angle plus final radius band.
     fn eval_survival(&self, generation: u32) -> Vec<bool> {
         match self.config.challenge {
             Challenge::Flock => {
                 let c = self.agents_centroid();
                 let r2 = FLOCK_RADIUS * FLOCK_RADIUS;
-                self.agents
+                self.order
                     .iter()
-                    .map(|a| {
-                        let p = a.get_pos();
+                    .map(|&e| {
+                        let p = self.pos_of(e);
                         let dx = p.0 as i32 - c.0 as i32;
                         let dy = p.1 as i32 - c.1 as i32;
                         dx * dx + dy * dy <= r2
@@ -711,24 +855,33 @@ impl Simulator {
                     .collect()
             }
             Challenge::Orbit => self
-                .agents
+                .order
                 .iter()
-                .map(|a| orbit_survives(a.get_pos(), a.accumulated_angle()))
+                .map(|&e| {
+                    let pos = self.pos_of(e);
+                    let angle = self
+                        .ecs
+                        .get::<&Agent>(e)
+                        .expect("live entity has Agent")
+                        .accumulated_angle();
+                    orbit_survives(pos, angle)
+                })
                 .collect(),
             challenge => self
-                .agents
+                .order
                 .iter()
-                .map(|a| challenge.survives(a.get_pos(), generation))
+                .map(|&e| challenge.survives(self.pos_of(e), generation))
                 .collect(),
         }
     }
 
     /// Mean position (centroid) of the current agents. `flock`'s survival zone
     /// is a disk about this point, so the target is wherever the crowd gathers.
+    /// Integer sum, so it is order-independent.
     fn agents_centroid(&self) -> (u32, u32) {
-        let n = self.agents.len().max(1) as u32;
-        let sum = self.agents.iter().fold((0u32, 0u32), |acc, a| {
-            let p = a.get_pos();
+        let n = self.order.len().max(1) as u32;
+        let sum = self.order.iter().fold((0u32, 0u32), |acc, &e| {
+            let p = self.pos_of(e);
             (acc.0 + p.0, acc.1 + p.1)
         });
         (sum.0 / n, sum.1 / n)
@@ -737,12 +890,16 @@ impl Simulator {
     /// Advance the simulation one step.
     ///
     /// Split into two phases for parallelism:
-    ///   (a) decision phase — parallel over agents against a start-of-tick
-    ///       snapshot of the world; each agent computes its sensor inputs and
-    ///       runs `Brain::step` (with a deterministic per-agent RNG) to produce
-    ///       a desired translation.
-    ///   (b) application phase — serial, in agent order, resolving collisions
-    ///       against the live (mutating) world.
+    ///   (a) decision phase — parallel over agents, reading the (unmutated) grid;
+    ///       each agent computes its sensor inputs and runs `Brain::step` (with a
+    ///       deterministic per-agent RNG) to produce a desired translation.
+    ///   (b) application phase — serial, in `order` sequence, resolving
+    ///       collisions against the live (mutating) grid.
+    ///
+    /// hecs archetype order is not stable, so the decision phase materializes the
+    /// creatures and sorts them into `order` before iterating: the parallel index
+    /// `i` is then the position in `order`, identical to the old `Vec<Agent>`
+    /// index, which is what makes the per-agent RNG reproducible.
     pub fn step(&mut self) {
         if self.current_steps >= self.config.steps_per_generation {
             self.spawn_next_generation();
@@ -751,48 +908,65 @@ impl Simulator {
         }
 
         let inputs = self.calc_step_inputs();
-        // The grid is read (occupancy) but not mutated during the decision
-        // phase — mutation is confined to the serial application below — so the
-        // closures can borrow it directly instead of cloning a snapshot.
-        let grid = &self.grid;
         let move_vectors = self.move_vectors.clone();
         let seed = self.config.seed;
         let generation = self.generation;
         let step = self.current_steps;
 
-        // (a) parallel decision phase
-        let translations: Vec<(i32, i32)> = self
-            .agents
-            .par_iter_mut()
-            .enumerate()
-            .map(|(i, agent)| {
-                let agent_pos = agent.get_pos();
-                let used = agent.get_used_inputs();
-                let all_inputs =
-                    calc_positional_inputs(grid, &move_vectors, agent_pos, &inputs, used);
-                let mut rng = ChaCha8Rng::seed_from_u64(agent_seed(seed, generation, step, i));
-                agent.step(all_inputs, &mut rng)
-            })
-            .collect();
+        // (a) parallel decision phase. The grid is read (occupancy) but not
+        // mutated here — mutation is confined to the serial application below —
+        // so the closures can borrow it directly instead of cloning a snapshot.
+        let translations: Vec<(i32, i32)> = {
+            let index: HashMap<Entity, usize> =
+                self.order.iter().enumerate().map(|(i, &e)| (e, i)).collect();
+            let grid = &self.grid;
+            let mut items: Vec<(Entity, &Position, &mut Agent)> = self
+                .ecs
+                .query_mut::<(Entity, &Position, &mut Agent)>()
+                .into_iter()
+                .collect();
+            // Reorder into stable birth order so `i` is the RNG index.
+            items.sort_by_key(|(e, _, _)| index[e]);
+            items
+                .par_iter_mut()
+                .enumerate()
+                .map(|(i, (_e, pos, agent))| {
+                    let agent_pos = (pos.x, pos.y);
+                    let used = agent.get_used_inputs();
+                    let all_inputs =
+                        calc_positional_inputs(grid, &move_vectors, agent_pos, &inputs, used);
+                    let mut rng =
+                        ChaCha8Rng::seed_from_u64(agent_seed(seed, generation, step, i));
+                    agent.step(all_inputs, &mut rng)
+                })
+                .collect()
+        };
 
-        // (b) serial application phase
+        // (b) serial application phase, in `order` sequence. Pair each entity
+        // (in order) with its translation up front, so the loop owns its data and
+        // is free to mutate the grid + position components as it goes.
         // `orbit` is the only challenge that needs path state; accumulate swept
         // angle here (serial => deterministic), and only when it's active.
         let track_angle = self.config.challenge == Challenge::Orbit;
         let (max_x, max_y) = (self.grid.max_x(), self.grid.max_y());
-        for (i, &translation) in translations.iter().enumerate() {
-            let agent_pos: (u32, u32) = self.agents[i].get_pos();
+        let moves: Vec<(Entity, (i32, i32))> =
+            self.order.iter().copied().zip(translations).collect();
+        for (entity, translation) in moves {
+            let agent_pos = self.pos_of(entity);
             let pos: (u32, u32) = (
                 (agent_pos.0 as i32 + translation.0).clamp(0, max_x) as u32,
                 (agent_pos.1 as i32 + translation.1).clamp(0, max_y) as u32,
             );
 
             if !self.get_pos(pos) {
-                self.grid.clear_occupied(agent_pos);
-                self.agents[i].set_pos(pos);
-                self.grid.set_occupied(pos);
+                self.grid.clear_occupant(agent_pos);
+                self.set_pos(entity, pos);
+                self.grid.set_occupant(pos, entity);
                 if track_angle {
-                    self.agents[i].add_angle(swept_angle(agent_pos, pos));
+                    self.ecs
+                        .get::<&mut Agent>(entity)
+                        .expect("live entity has Agent")
+                        .add_angle(swept_angle(agent_pos, pos));
                 }
             }
         }
@@ -814,16 +988,22 @@ impl Simulator {
     */
     fn calc_step_inputs(&mut self) -> Vec<f32> {
         let mut inputs: Vec<f32> = vec![0.0; 7];
-        let mut av: (u32, u32) = (0, 0);
 
-        for a in &self.agents {
-            av = (av.0 + a.get_pos().0, av.1 + a.get_pos().1);
+        // Population centroid — an integer sum, so it is order-independent and
+        // can be read straight off a query without touching `order`.
+        let (mut sx, mut sy, mut count) = (0u32, 0u32, 0u32);
+        {
+            let mut q = self.ecs.query::<&Position>();
+            for p in q.iter() {
+                sx += p.x;
+                sy += p.y;
+                count += 1;
+            }
         }
-
         // max(1) guards the empty-population case without changing the result
         // (sums are then 0, so the average is 0 either way).
-        let n = self.agents.len().max(1) as u32;
-        av = (av.0 / n, av.1 / n);
+        let n = count.max(1);
+        let av = (sx / n, sy / n);
 
         inputs[0] = 0.0;
         inputs[1] = 1.0;
@@ -855,11 +1035,12 @@ impl Simulator {
     /// incremented) and the current agents.
     fn record_generation(&mut self, survived: &[bool]) {
         let wall_ms = self.gen_start.elapsed().as_secs_f64() * 1000.0;
-        let n = self.agents.len();
+        let n = self.order.len();
 
         let survivors = survived.iter().filter(|&&s| s).count() as u32;
-        let max_final_y = self.agents.iter().map(|a| a.get_pos().1).max().unwrap_or(0);
-        let sum_y: u64 = self.agents.iter().map(|a| a.get_pos().1 as u64).sum();
+        // max / sum over final y — order-independent aggregates.
+        let max_final_y = self.order.iter().map(|&e| self.pos_of(e).1).max().unwrap_or(0);
+        let sum_y: u64 = self.order.iter().map(|&e| self.pos_of(e).1 as u64).sum();
         let mean_final_y = if n > 0 { sum_y as f64 / n as f64 } else { 0.0 };
         let survival_rate = if n > 0 { survivors as f64 / n as f64 } else { 0.0 };
 
@@ -888,8 +1069,10 @@ impl Simulator {
 
     /// Mean pairwise Hamming distance (bits) over a random sample of agent
     /// pairs, using a dedicated deterministic RNG so it never perturbs the sim.
+    /// Pairs are sampled by `order` index (identical to the old `Vec<Agent>`
+    /// index), so the measurement is reproducible for a given seed.
     fn genome_diversity(&self) -> f64 {
-        let n = self.agents.len();
+        let n = self.order.len();
         if n < 2 {
             return 0.0;
         }
@@ -906,11 +1089,12 @@ impl Simulator {
             while b == a {
                 b = rng.random_range(0..n);
             }
-            let ga = &self.agents[a].genome;
-            let gb = &self.agents[b].genome;
+            let ga = self.ecs.get::<&Agent>(self.order[a]).expect("live entity has Agent");
+            let gb = self.ecs.get::<&Agent>(self.order[b]).expect("live entity has Agent");
             total += ga
+                .genome
                 .iter()
-                .zip(gb.iter())
+                .zip(gb.genome.iter())
                 .map(|(x, y)| (x ^ y).count_ones() as u64)
                 .sum::<u64>();
         }
@@ -924,16 +1108,19 @@ impl Simulator {
         if self.champion_interval == 0 || !self.generation.is_multiple_of(self.champion_interval) {
             return;
         }
-        let Some(best) = self
-            .agents
-            .iter()
-            .max_by_key(|a| a.get_pos().1)
-        else {
+        // Highest final y wins; iterating `order` keeps the tie-break stable.
+        let Some(&best) = self.order.iter().max_by_key(|&&e| self.pos_of(e).1) else {
             return;
         };
+        let genome = self
+            .ecs
+            .get::<&Agent>(best)
+            .expect("live entity has Agent")
+            .genome
+            .clone();
         let champion = Champion {
             config: self.config.clone(),
-            genome: best.genome.clone(),
+            genome,
         };
         if let Ok(json) = serde_json::to_string_pretty(&champion) {
             let _ = std::fs::write(path, json);
@@ -1107,11 +1294,10 @@ mod tests {
             cfg.challenge = challenge;
             let mut sim = Simulator::new(cfg);
             sim.generate_initial_generation();
-            for a in &sim.agents {
+            for pos in sim.positions() {
                 assert!(
-                    !challenge.survives(a.get_pos(), 0),
-                    "{challenge:?}: agent spawned inside survival zone at {:?}",
-                    a.get_pos()
+                    !challenge.survives(pos, 0),
+                    "{challenge:?}: agent spawned inside survival zone at {pos:?}"
                 );
             }
         }
@@ -1155,8 +1341,8 @@ mod tests {
 
         // No two agents share a cell.
         let mut seen = std::collections::HashSet::new();
-        for a in &sim.agents {
-            assert!(seen.insert(a.get_pos()), "duplicate agent position");
+        for pos in sim.positions() {
+            assert!(seen.insert(pos), "duplicate agent position");
         }
         // The barrier row cells are occupied (obstacle present).
         for x in 10..=118u32 {
@@ -1168,8 +1354,8 @@ mod tests {
         for _ in 0..30 {
             sim.step();
             let mut seen = std::collections::HashSet::new();
-            for a in &sim.agents {
-                assert!(seen.insert(a.get_pos()), "two agents on one cell after step");
+            for pos in sim.positions() {
+                assert!(seen.insert(pos), "two agents on one cell after step");
             }
         }
     }
@@ -1209,12 +1395,13 @@ mod tests {
         // lineage verbatim (unchanged by mutation).
         let mut sim = Simulator::new(test_config(99));
         sim.generate_initial_generation();
-        for (i, a) in sim.agents.iter().enumerate() {
-            assert_eq!(a.lineage, i as u32, "founder {i} should have lineage {i}");
+        for (i, &e) in sim.order.iter().enumerate() {
+            let lineage = sim.ecs.get::<&Agent>(e).unwrap().lineage;
+            assert_eq!(lineage, i as u32, "founder {i} should have lineage {i}");
         }
-        let parent = &sim.agents[7];
+        let parent = sim.ecs.get::<&Agent>(sim.order[7]).unwrap();
         let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let child = parent.produce_child(0.5, (0, 0), &mut rng);
+        let child = parent.produce_child(0.5, &mut rng);
         assert_eq!(child.lineage, parent.lineage, "child must inherit parent lineage");
     }
 
@@ -1240,8 +1427,8 @@ mod tests {
             a.step();
             b.step();
         }
-        let pa: Vec<_> = a.agents.iter().map(|x| x.get_pos()).collect();
-        let pb: Vec<_> = b.agents.iter().map(|x| x.get_pos()).collect();
+        let pa = a.positions();
+        let pb = b.positions();
         assert_eq!(pa, pb, "same seed diverged");
     }
 
@@ -1255,8 +1442,8 @@ mod tests {
             a.step();
             b.step();
         }
-        let pa: Vec<_> = a.agents.iter().map(|x| x.get_pos()).collect();
-        let pb: Vec<_> = b.agents.iter().map(|x| x.get_pos()).collect();
+        let pa = a.positions();
+        let pb = b.positions();
         assert_ne!(pa, pb, "different seeds produced identical state");
     }
 
@@ -1331,11 +1518,14 @@ mod tests {
         cfg.challenge = Challenge::Flock;
         let mut sim = Simulator::new(cfg);
         let genome = vec![0u32; 8];
-        let mut agents: Vec<Agent> =
-            (0..20).map(|_| Agent::new(&genome, 8, (64, 64), 0)).collect();
-        agents.push(Agent::new(&genome, 8, (64, 64), 0)); // index 20: in the blob
-        agents.push(Agent::new(&genome, 8, (120, 120), 0)); // index 21: far away
-        sim.agents = agents;
+        // 21 agents in the blob at the center (indices 0..=20), one far away
+        // (index 21). Spawn straight into the ECS + order; eval_survival reads
+        // positions and the crowd centroid, not the grid, so occupancy is moot.
+        for i in 0..22u32 {
+            let p = if i == 21 { (120, 120) } else { (64, 64) };
+            let e = sim.ecs.spawn((Position { x: p.0, y: p.1 }, Agent::new(&genome, 8, 0)));
+            sim.order.push(e);
+        }
         let survived = sim.eval_survival(0);
         assert!(survived[20], "an agent inside the crowd blob should survive flock");
         assert!(!survived[21], "an agent far from the crowd centroid should not");
@@ -1359,16 +1549,45 @@ mod tests {
             a.step();
             b.step();
         }
-        let fa: Vec<_> = a
-            .agents
+        let finals = |s: &Simulator| -> Vec<((u32, u32), u32)> {
+            s.order
+                .iter()
+                .map(|&e| {
+                    let pos = s.pos_of(e);
+                    let ang = s.ecs.get::<&Agent>(e).unwrap().accumulated_angle().to_bits();
+                    (pos, ang)
+                })
+                .collect()
+        };
+        assert_eq!(finals(&a), finals(&b), "orbit run diverged under an identical seed");
+    }
+
+    #[test]
+    fn order_is_stable_across_a_cull() {
+        // The cull must preserve survivors' relative birth order (so the RNG
+        // index stays put) and despawn exactly the losers. Keep evens, drop odds.
+        let mut sim = Simulator::new(test_config(3));
+        sim.generate_initial_generation();
+        let before: Vec<Entity> = sim.order.clone();
+        let survived: Vec<bool> = (0..before.len()).map(|i| i % 2 == 0).collect();
+
+        sim.cull_to_survivors(&survived);
+
+        let expected: Vec<Entity> = before
             .iter()
-            .map(|x| (x.get_pos(), x.accumulated_angle().to_bits()))
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 0)
+            .map(|(_, &e)| e)
             .collect();
-        let fb: Vec<_> = b
-            .agents
-            .iter()
-            .map(|x| (x.get_pos(), x.accumulated_angle().to_bits()))
-            .collect();
-        assert_eq!(fa, fb, "orbit run diverged under an identical seed");
+        assert_eq!(sim.order, expected, "cull must preserve survivors' relative order");
+        // Every survivor is still live; every culled entity is gone.
+        for (i, &e) in before.iter().enumerate() {
+            assert_eq!(
+                sim.ecs.contains(e),
+                i % 2 == 0,
+                "entity at index {i} has wrong liveness after cull"
+            );
+        }
+        assert_eq!(sim.ecs.len() as usize, expected.len(), "world holds untracked entities");
     }
 }

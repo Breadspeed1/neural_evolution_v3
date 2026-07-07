@@ -1,5 +1,4 @@
-use std::ops::{Range, RangeBounds, RangeInclusive};
-use libm::pow;
+use std::ops::RangeInclusive;
 
 pub fn get_segment(dec: &u32, /*mask: &u32*/ range: RangeInclusive<i32>) -> u32 {
     //((dec >> 31 - range.end()) << 31 - (range.end() - range.start()) >> 31 - (range.end()) - range.start())

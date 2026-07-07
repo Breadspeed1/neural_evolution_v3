@@ -1,5 +1,4 @@
-use libm::tanh;
-use rand::Rng;
+use rand::RngExt;
 use serde::{Serialize};
 
 mod binary_util;
@@ -79,12 +78,12 @@ impl Agent {
     }
 
     fn mutate_genome(&mut self, mutation_rate: f32) -> Vec<u32> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mut out: Vec<u32> = self.genome.clone();
 
         for i in 0..out.len() {
             for j in 0..31 {
-                if rng.gen_range(0..(1.0/mutation_rate) as i32) == 0 {
+                if rng.random_range(0..(1.0/mutation_rate) as i32) == 0 {
                     out[i] = binary_util::flip(&out[i], j)
                 }
             }
@@ -150,8 +149,8 @@ impl Brain {
         let mut request = (0, 0);
 
         if self.neurons[2][0] > self.move_activation {
-            let mut rand = rand::thread_rng();
-            request = (request.0 + rand.gen_range(-1..1), request.1 + rand.gen_range(-1..1));
+            let mut rand = rand::rng();
+            request = (request.0 + rand.random_range(-1..1), request.1 + rand.random_range(-1..1));
         }
 
         let move_vec: Vec<(i32, i32)> = vec![
@@ -188,7 +187,7 @@ impl Brain {
         }
 
         for i in 0..self.neurons[2].len() {
-            self.neurons[2][i] = tanh(self.neurons[2][i] as f64) as f32
+            self.neurons[2][i] = (self.neurons[2][i] as f64).tanh() as f32
         }
     }
 
@@ -196,7 +195,7 @@ impl Brain {
         let connection: &Connection = &self.connections[index];
 
         if connection.source_type != 0 {
-            self.neurons[connection.source_type as usize][connection.source_id as usize] = libm::tanh(self.neurons[connection.source_type as usize][connection.source_id as usize] as f64) as f32;
+            self.neurons[connection.source_type as usize][connection.source_id as usize] = (self.neurons[connection.source_type as usize][connection.source_id as usize] as f64).tanh() as f32;
         }
 
         self.neurons[connection.sink_type as usize][connection.sink_id as usize] += connection.weight * self.neurons[connection.source_type as usize][connection.source_id as usize];

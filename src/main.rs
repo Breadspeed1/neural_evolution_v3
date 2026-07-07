@@ -1,27 +1,30 @@
 use std::fs::File;
-use std::{thread, time};
-use std::ops::{Add, AddAssign, Not, Sub, SubAssign};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers, read};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use image::{EncodableLayout, Frame, ImageBuffer, Rgba, RgbaImage};
+use image::{Frame, ImageBuffer, RgbaImage};
 use image::codecs::gif::{GifEncoder};
-use rand::{Rng};
-use show_image::{create_window, Image, ImageInfo, ImageView, WindowOptions, WindowProxy};
+use macroquad::prelude::*;
+use ::rand::RngExt;
 use crate::agent::Agent;
 
 mod agent;
 
-#[show_image::main]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "Neural Evolution".to_owned(),
+        window_width: 1080,
+        window_height: 1080,
+        ..Default::default()
+    }
+}
+
+#[macroquad::main(window_conf)]
+async fn main() {
     let genome_length: u32 = 256;
     let amount_inners: u32 = 225;
     let mutation_rate: f32 = 0.001;
     let steps_per_generation: u32 = 200;
     let population: u32 = 1000;
     let generate_gifs: bool = false;
-    let toggle: Arc<Mutex<bool>> = Arc::new(Mutex::new(true));
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
         ((10, 108), (118, 108)),
         /*((10, 107), (10, 20)),
@@ -36,66 +39,92 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         population,
         obstacles,
         generate_gifs,
-        Arc::clone(&toggle)
     );
 
-    run_sim(&mut simulator, Arc::clone(&toggle));
-
-    Ok(())
+    run_sim(&mut simulator).await;
 }
 
-fn run_sim(simulator: &mut Simulator, toggle: Arc<Mutex<bool>>) {
+async fn run_sim(simulator: &mut Simulator) {
     simulator.generate_initial_generation();
-    let generations = 723048912;
-    let step_time_mutex: Arc<Mutex<u64>> = Arc::new(Mutex::new(5));
-
-    enable_raw_mode().unwrap();
-
-    let step_time = Arc::clone(&step_time_mutex);
-    thread::spawn( move || {
-        loop {
-            match read().unwrap() {
-                Event::Key(KeyEvent {
-                               code: KeyCode::Char('q'),
-                               modifiers: KeyModifiers::NONE
-                           }) => {
-                    if *step_time.lock().unwrap() >= 5 {
-                        step_time.lock().unwrap().sub_assign(5);
-                        println!("step delay changed to {}ms", *step_time.lock().unwrap());
-                    }
-                },
-
-                Event::Key(KeyEvent {
-                               code: KeyCode::Char('e'),
-                               modifiers: KeyModifiers::NONE
-                           }) => {
-                    step_time.lock().unwrap().add_assign(5);
-                    println!("step delay changed to {}ms", *step_time.lock().unwrap());
-                },
-
-                Event::Key(KeyEvent {
-                               code: KeyCode::Char('v'),
-                               modifiers: KeyModifiers::NONE
-                           }) => {
-                    let val = *toggle.lock().unwrap();
-                    *toggle.lock().unwrap() = !val;
-                    println!("toggling display");
-                },
-
-                _ => ()
-            }
-        }
-    });
+    let generations: u32 = 723048912;
+    // step delay in milliseconds (q lowers, e raises, floor 0)
+    let mut step_delay: u64 = 5;
+    // whether the world is rendered each frame
+    let mut display: bool = true;
+    // when display is off, how many sim steps to run per frame
+    let steps_per_frame_headless: u32 = 1000;
 
     let now = Instant::now();
+
     while simulator.generation < generations {
-        simulator.step();
-        if simulator.current_steps == 0 {
-            println!("on generation {}", simulator.generation);
+        // --- input handling ---
+        if is_key_pressed(KeyCode::Q) {
+            step_delay = step_delay.saturating_sub(5);
+            println!("step delay changed to {}ms", step_delay);
         }
-        thread::sleep(Duration::from_millis(*step_time_mutex.lock().unwrap()));
+        if is_key_pressed(KeyCode::E) {
+            step_delay += 5;
+            println!("step delay changed to {}ms", step_delay);
+        }
+        if is_key_pressed(KeyCode::V) {
+            display = !display;
+            println!("toggling display");
+        }
+
+        if display {
+            let frame = simulator.step(true);
+            if simulator.current_steps == 0 {
+                println!("on generation {}", simulator.generation);
+            }
+
+            clear_background(WHITE);
+            if let Some(image) = frame {
+                draw_world(&image);
+            }
+
+            if step_delay > 0 {
+                std::thread::sleep(Duration::from_millis(step_delay));
+            }
+            next_frame().await;
+        } else {
+            // headless burst: run many steps without drawing, then yield a frame
+            for _ in 0..steps_per_frame_headless {
+                simulator.step(false);
+                if simulator.current_steps == 0 {
+                    println!("on generation {}", simulator.generation);
+                }
+                if simulator.generation >= generations {
+                    break;
+                }
+            }
+            clear_background(WHITE);
+            next_frame().await;
+        }
     }
-    println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32()/60.0);
+
+    println!("{} gens took {} minutes", generations, now.elapsed().as_secs_f32() / 60.0);
+}
+
+/// Draw the 128x128 world scaled up to fill the window, preserving aspect
+/// ratio, with nearest-neighbour filtering for crisp pixels.
+fn draw_world(image: &RgbaImage) {
+    let texture = Texture2D::from_rgba8(128, 128, image.as_raw());
+    texture.set_filter(FilterMode::Nearest);
+
+    let size = screen_width().min(screen_height());
+    let x = (screen_width() - size) / 2.0;
+    let y = (screen_height() - size) / 2.0;
+
+    draw_texture_ex(
+        &texture,
+        x,
+        y,
+        WHITE,
+        DrawTextureParams {
+            dest_size: Some(vec2(size, size)),
+            ..Default::default()
+        },
+    );
 }
 
 struct GenerationOutput {
@@ -149,17 +178,10 @@ struct Simulator {
     output: GenerationOutput,
     obstacles: Vec<((u32, u32), (u32, u32))>,
     use_output: bool,
-    window: WindowProxy,
-    toggle: Arc<Mutex<bool>>
 }
 
 impl Simulator {
-    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool, toggle: Arc<Mutex<bool>>) -> Simulator {
-        let mut options: WindowOptions = WindowOptions::default();
-        options.preserve_aspect_ratio = true;
-        options.size = Some([1080 as u32, 1080 as u32]);
-        options.default_controls = false;
-
+    fn new(genome_length: u32, amount_inners: u32, mutation_rate: f32, steps_per_generation: u32, population: u32, obstacles: Vec<((u32, u32), (u32, u32))>, use_output: bool) -> Simulator {
         Simulator {
             world: vec![0; 128],
             agents: Vec::new(),
@@ -183,8 +205,6 @@ impl Simulator {
             output: GenerationOutput::new(),
             obstacles,
             use_output,
-            window: create_window("g", options).unwrap(),
-            toggle
         }
     }
 
@@ -209,10 +229,10 @@ impl Simulator {
     }
 
     fn rand_pos(&mut self) -> (u32, u32) {
-        let mut rand = rand::thread_rng();
-        let mut pos: (u32, u32) = (rand.gen_range(0..127), rand.gen_range(0..127));
+        let mut rand = ::rand::rng();
+        let mut pos: (u32, u32) = (rand.random_range(0..127), rand.random_range(0..127));
         while self.get_pos(pos) {
-            pos = (rand.gen_range(0..127), rand.gen_range(0..127));
+            pos = (rand.random_range(0..127), rand.random_range(0..127));
         }
         self.toggle_pos(pos);
 
@@ -224,7 +244,8 @@ impl Simulator {
     }
 
     fn reset_output(&mut self) {
-        self.output.save(format!("G:\\\\Visualizer_Output\\generation-{}.gif", self.generation));
+        std::fs::create_dir_all("output").unwrap();
+        self.output.save(format!("output/generation-{}.gif", self.generation));
         self.output = GenerationOutput::new();
     }
 
@@ -257,13 +278,14 @@ impl Simulator {
         self.add_obstacles();
     }
 
-    fn step(&mut self) {
+    /// Advance the simulation one step. When `show_image` is true, returns the
+    /// rendered 128x128 world for this step; otherwise returns `None`.
+    fn step(&mut self, show_image: bool) -> Option<RgbaImage> {
         if self.current_steps >= self.steps_per_generation {
             self.spawn_next_generation();
             self.current_steps = 0;
-            return;
+            return None;
         }
-        let show_image = *self.toggle.lock().unwrap();
 
         let mut image: RgbaImage = RgbaImage::default();
         if show_image {
@@ -287,19 +309,21 @@ impl Simulator {
             }
 
             if show_image {
-                let mut pix = image.get_pixel_mut(pos.0, pos.1);
+                let pix = image.get_pixel_mut(pos.0, pos.1);
                 pix.0 = self.agents[i].get_rgba();
             }
         }
 
         self.current_steps += 1;
 
-        if show_image {
-            self.window.set_image("generation x", ImageView::new(ImageInfo::rgba8(128, 128), image.as_bytes())).unwrap();
-        }
-
         if self.use_output {
             self.update_output();
+        }
+
+        if show_image {
+            Some(image)
+        } else {
+            None
         }
     }
 
@@ -345,7 +369,7 @@ impl Simulator {
         inputs[1] = 1.0;
         inputs[2] = (self.current_steps % 2) as f32;
         inputs[3] = self.current_steps as f32/self.steps_per_generation as f32;
-        inputs[4] = rand::thread_rng().gen_range(0.0..1.0);
+        inputs[4] = ::rand::rng().random_range(0.0..1.0);
         inputs[5] = av.1 as f32 / 127.0;
         inputs[6] = av.0 as f32 / 127.0;
 
@@ -354,9 +378,9 @@ impl Simulator {
 
     fn random_genome(&self) -> Vec<u32> {
         let mut genome: Vec<u32> = Vec::new();
-        let mut rand = rand::thread_rng();
+        let mut rand = ::rand::rng();
 
-        (0..self.genome_length).for_each(|_| {genome.push(rand.gen::<u32>())});
+        (0..self.genome_length).for_each(|_| {genome.push(rand.random::<u32>())});
 
         genome
     }

@@ -35,10 +35,16 @@ Every step in this roadmap obeys the inversion of that mistake:
 - **Harness**: lib + headless/viewer bins, clap CLI, per-generation JSONL
   metrics (survival, mean/max final y, genome diversity), champion save/load,
   `--bench` regression gate, unit tests incl. determinism.
-- **Challenges** (`--challenge`): `north-band` (default), `corners`, `gauntlet`,
-  `moving-band`, `enclosure` — each an obstacle layout + survival predicate, with
-  documented baseline curves (see `CHALLENGES.md`). `moving-band` and `enclosure`
-  are the two that stay unsaturated and reward real behavior.
+- **Challenges** (`--challenge`): the positional set `north-band` (default),
+  `corners`, `gauntlet`, `moving-band`, `enclosure`, plus the pattern-forming set
+  `flock`, `ring`, `heart`, `orbit` — each an obstacle layout + survival
+  predicate, with documented baseline curves (see `CHALLENGES.md`). All climb
+  under selection; the pattern set sculpts the swarm into a blob, ring, heart, or
+  pinwheel.
+- **Sensors**: 17 inputs — constants, oscillator, age, random, global crowd
+  centroid, eight directional obstacle sensors, and (new) two self-position
+  sensors (`x/127`, `y/127`) that let an agent navigate to absolute coordinates,
+  which is what unlocks the pattern challenges.
 - **Dashboard**: dark-themed live viewer — world with challenge-aware terrain
   tinting, survival/diversity sparklines, lineage coloring, a live brain-inspector
   node-link diagram, motion trails, oriented agents, generation-turnover pulse,
@@ -73,7 +79,23 @@ panel shows static wiring, not activity. Fixes:
 *Gate: one creature's decisions are legible from its brain panel; a lineage sweep
 is visible in the strip.*
 
-### 2. Phase C — CTRNN brains
+### 2. Creative visual goals — position sensor + pattern challenges *(current)*
+The near-term payoff: selection targets that make the swarm *draw* something.
+Landed here is the self-position sensor (inputs 15/16) plus four position-based
+challenges — `flock` (converge to a blob), `ring` (hold a radius), `heart` (fill
+an implicit heart curve), `orbit` (circle the center). The self-position sensor is
+the enabling change: without it an agent senses only the crowd and walls, so it
+can follow but never navigate to a coordinate. Each challenge ships with a seeded
+baseline curve (`CHALLENGES.md`) and shows a clean climb from a low gen-0 floor.
+The static targets (`ring`, `heart`) already tint the world overlay for free; the
+dynamic ones (`flock`, `orbit`) still want a viewer readout (crowd blob / rotation
+arc) to be fully legible, which rides with the storytelling pass above.
+
+*Gate (met for the sim half): all four evolve a visible climb (`heart` 3 → 70%,
+`flock` 1 → 56%, `ring` 3 → 62%, `orbit` 2 → 24%). Remaining: a viewer treatment
+for the two dynamic goals.*
+
+### 3. Phase C — CTRNN brains
 Upgrade neurons to continuous-time recurrent leaky integrators (per-neuron time
 constant + bias, persistent state across steps, inner↔inner recurrence) on the
 **same sparse connection genome**. Memory and timing are prerequisites for most
@@ -85,7 +107,7 @@ interesting behavior — a feed-forward net cannot "remember where food was."
 reward memory), shown as paired baseline curves. If it doesn't, understand why
 before proceeding.*
 
-### 3. Continuous world + energy/food
+### 4. Continuous world + energy/food
 The biggest unlock: make survival **behavioral** (forage, don't starve) instead
 of **positional** (be north at the buzzer). Introduces exploration/exploitation
 tradeoffs and, if food regrows, boom/bust population cycles — the sim becomes an
@@ -96,7 +118,7 @@ itself.
 *Gate: a foraging strategy measurably outperforms a random walker; population
 shows density-dependent dynamics.*
 
-### 4. Pheromone / stigmergy layer
+### 5. Pheromone / stigmergy layer
 A diffusing scalar field agents deposit into and sense (another `Vec<f32>` grid,
 like the world). This is how ants form trails with no central control — and it is
 the project's likely **beauty peak**: a living, glowing substrate the creatures
@@ -105,11 +127,11 @@ paint as they move. Cheap to add, high visual and behavioral reward.
 *Gate: visible deposit→follow trails form between resources without being
 hand-coded.*
 
-### 5. Predation / multi-species
+### 6. Predation / multi-species
 A second population (or intraspecific predation) drives a prey–predator arms race:
 evasion, pursuit, possibly pack behavior — the richest emergence available, and
-the most spectacular to watch. Depends on the continuous world (3) and benefits
-from memory (2) and signaling fields (4).
+the most spectacular to watch. Depends on the continuous world (4) and benefits
+from memory (3) and signaling fields (5).
 
 *Gate: coupled population dynamics (Lotka–Volterra-like oscillation) and at least
 one evolved pursuit or evasion behavior.*
@@ -126,4 +148,4 @@ one evolved pursuit or evasion behavior.*
 Eventually: **continuous (generation-less) evolution** in a larger world, where
 birth/death are local events driven by energy rather than a global generation
 clock. The steps above are chosen so that this arrives as the natural consequence
-of stages 3–5, not as a rewrite.
+of stages 4–6, not as a rewrite.

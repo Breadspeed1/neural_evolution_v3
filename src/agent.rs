@@ -51,7 +51,7 @@ impl Agent {
         self.brain.step(input)
     }
 
-    pub fn produce_child(&mut self, mutation_rate: f32, pos: (u32, u32)) -> Agent {
+    pub fn produce_child(&self, mutation_rate: f32, pos: (u32, u32)) -> Agent {
         let genome = self.mutate_genome(mutation_rate);
         Agent::new(
             &genome,
@@ -77,16 +77,37 @@ impl Agent {
         ]
     }
 
-    fn mutate_genome(&mut self, mutation_rate: f32) -> Vec<u32> {
-        let mut rng = rand::rng();
+    /// Flip each bit of the genome independently with probability
+    /// `mutation_rate` (matching the original per-bit trial), but instead of
+    /// rolling the RNG once per bit we sample the gaps between flipped bits
+    /// from a geometric distribution. For the default rate (0.001) this turns
+    /// ~8192 RNG calls per agent into ~8, with the identical flip distribution.
+    fn mutate_genome(&self, mutation_rate: f32) -> Vec<u32> {
         let mut out: Vec<u32> = self.genome.clone();
+        let p = mutation_rate as f64;
+        if p <= 0.0 {
+            return out;
+        }
 
-        for i in 0..out.len() {
-            for j in 0..32 {
-                if rng.random_range(0..(1.0/mutation_rate) as i32) == 0 {
-                    out[i] = binary_util::flip(&out[i], j)
-                }
+        let mut rng = rand::rng();
+        let total_bits = out.len() * 32;
+        let ln_1mp = (1.0 - p).ln();
+        let mut pos: usize = 0;
+
+        loop {
+            // Number of bits that are *not* flipped before the next flip:
+            // geometric with success probability p.
+            let u: f64 = rng.random::<f64>();
+            let skip_f = u.ln() / ln_1mp;
+            if !skip_f.is_finite() {
+                break;
             }
+            pos = pos.saturating_add(skip_f.floor() as usize);
+            if pos >= total_bits {
+                break;
+            }
+            out[pos / 32] = binary_util::flip(&out[pos / 32], pos % 32);
+            pos += 1;
         }
 
         out

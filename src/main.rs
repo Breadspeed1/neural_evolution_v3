@@ -72,6 +72,10 @@ const SOIL_RGB: [u8; 3] = [104, 74, 48]; // warm earthy brown
 const PLANT_RGB: [u8; 3] = [76, 196, 96]; // living green
 const PLANT_HUE: Color = Color::new(76.0 / 255.0, 196.0 / 255.0, 96.0 / 255.0, 1.0);
 const NUTRIENT_HUE: Color = Color::new(176.0 / 255.0, 138.0 / 255.0, 96.0 / 255.0, 1.0);
+// Herbivore accent (a warm amber, distinct from the plant/soil greens & browns)
+// for the population sparkline and the creatures legend swatch.
+const HERB_HUE: Color = Color::new(232.0 / 255.0, 176.0 / 255.0, 64.0 / 255.0, 1.0);
+const HERB_RGB: [u8; 3] = [232, 176, 64];
 
 const MARGIN: f32 = 14.0;
 /// How many recent positions each agent's motion trail retains.
@@ -461,8 +465,10 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
 
         if let Some(path) = &screenshot_path
             && !shot
-            && eco.tick_count() >= 700
+            && eco.tick_count() >= 2000
         {
+            // Grab once the meadow has passed its pioneer bloom and settled into
+            // the plant↔herbivore coexistence, so the shot shows the steady state.
             get_screen_data().export_png(path);
             println!("screenshot saved to {path}");
             shot = true;
@@ -471,8 +477,9 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
     }
 }
 
-/// Composite the meadow into the grid-sized texture (nutrient wash + plant green
-/// + obstacles) and blit it into the world square with nearest-neighbour scaling.
+/// Composite the meadow into the grid-sized texture (a nutrient wash under plant
+/// green, obstacles solid), blit it into the world square with nearest-neighbour
+/// scaling, then draw the herbivores on top as bright lineage-colored creatures.
 fn draw_eco_world(eco: &EcoSim, world_px: f32, image: &mut Image, texture: &Texture2D) {
     let p = eco.params();
     let (soil_cap, biomass_max) = (p.soil_cap.max(1e-6), p.biomass_max.max(1e-6));
@@ -491,6 +498,21 @@ fn draw_eco_world(eco: &EcoSim, world_px: f32, image: &mut Image, texture: &Text
             ..Default::default()
         },
     );
+
+    // Herbivores: a bright dot per creature, hue = lineage (dynasty), brightness
+    // rising with energy so a starving animal reads dim and a fat one pops. A
+    // thin dark ring keeps them legible over the green. Radius floors at ~1.6px
+    // so they never vanish on a big meadow.
+    let cell = world_px / eco.width().max(1) as f32;
+    let r = (cell * 0.52).max(1.6);
+    for h in eco.herbivore_views() {
+        let (cx, cy) = ((h.pos.0 as f32 + 0.5) * cell, (h.pos.1 as f32 + 0.5) * cell);
+        let hue = (h.lineage as f32 * 0.618_034).fract();
+        let light = 0.44 + 0.26 * h.energy_frac;
+        let (cr, cg, cb) = hsl_to_rgb(hue, 0.85, light);
+        draw_circle(cx, cy, r + 0.6, Color::new(0.04, 0.05, 0.03, 0.85));
+        draw_circle(cx, cy, r, Color::new(cr, cg, cb, 1.0));
+    }
 }
 
 /// One cell's diorama pixel: obstacles solid, otherwise the dark world with a
@@ -529,13 +551,19 @@ fn draw_eco_dashboard(
     let dim = measure_text(&hud, None, 15, 1.0);
     draw_text(&hud, world_px - dim.width - 12.0, 20.0, 15.0, MUTED);
 
-    let status_h = 168.0;
+    let status_h = 214.0;
     draw_eco_status_panel(eco, col_x, y, col_w, status_h, target_sps, unlimited, display);
     y += status_h + MARGIN;
 
-    let spark_h = 128.0;
+    // Three coupled series so the predator-prey story reads top to bottom: plant
+    // coverage, herbivore population (the prey/predator pair), and total biomass.
+    let spark_h = 116.0;
     let coverage: Vec<f32> = eco.metrics_history().iter().map(|m| m.coverage as f32).collect();
-    draw_sparkline(col_x, y, col_w, spark_h, &coverage, Some((0.0, 1.0)), "coverage", PLANT_HUE, true, "{:.0}%", 100.0);
+    draw_sparkline(col_x, y, col_w, spark_h, &coverage, Some((0.0, 1.0)), "plant coverage", PLANT_HUE, true, "{:.0}%", 100.0);
+    y += spark_h + MARGIN;
+
+    let population: Vec<f32> = eco.metrics_history().iter().map(|m| m.population as f32).collect();
+    draw_sparkline(col_x, y, col_w, spark_h, &population, None, "herbivores", HERB_HUE, true, "{:.0}", 1.0);
     y += spark_h + MARGIN;
 
     let biomass: Vec<f32> = eco.metrics_history().iter().map(|m| m.total_biomass as f32).collect();
@@ -571,7 +599,10 @@ fn draw_eco_status_panel(
     let m = eco.latest();
     let coverage = m.map(|m| m.coverage).unwrap_or(0.0);
     let biomass = m.map(|m| m.total_biomass).unwrap_or(0.0);
-    let nutrient = m.map(|m| m.mean_nutrient).unwrap_or(0.0);
+    let population = m.map(|m| m.population).unwrap_or(0);
+    let mean_energy = m.map(|m| m.mean_energy).unwrap_or(0.0);
+    let births = m.map(|m| m.births).unwrap_or(0);
+    let deaths = m.map(|m| m.deaths).unwrap_or(0);
     let speed = if unlimited { "unlimited".to_string() } else { format!("{:.0}/s", target_sps) };
 
     let label_x = x + pad;
@@ -583,11 +614,12 @@ fn draw_eco_status_panel(
         draw_text(value, value_x, *ly, 17.0, vcol);
         *ly += row_h;
     };
-    row("mode", "eco  ·  terrarium", TEXT_SECONDARY, &mut ly);
+    row("mode", "eco  ·  terrarium (rung 2)", TEXT_SECONDARY, &mut ly);
     row("tick", &eco.tick_count().to_string(), TEXT_PRIMARY, &mut ly);
-    row("coverage", &format!("{:.1}%", coverage * 100.0), TEXT_PRIMARY, &mut ly);
-    row("biomass", &format!("{biomass:.0}"), TEXT_SECONDARY, &mut ly);
-    row("nutrient", &format!("{nutrient:.3} mean"), TEXT_SECONDARY, &mut ly);
+    row("plants", &format!("{:.1}% cover  ·  {biomass:.0} mass", coverage * 100.0), TEXT_SECONDARY, &mut ly);
+    row("herbivores", &population.to_string(), TEXT_PRIMARY, &mut ly);
+    row("mean energy", &format!("{mean_energy:.2}"), TEXT_SECONDARY, &mut ly);
+    row("flux", &format!("+{births} births  ·  -{deaths} deaths"), TEXT_SECONDARY, &mut ly);
     row("speed", &format!("{speed}   display {}", if display { "on" } else { "off" }), TEXT_SECONDARY, &mut ly);
 }
 
@@ -603,14 +635,14 @@ fn draw_eco_layers_panel(x: f32, y: f32, w: f32, h: f32) {
         draw_text(label, x + pad + 24.0, sy + 2.0, 16.0, TEXT_SECONDARY);
     };
     let mut sy = y + 52.0;
+    swatch(sy, rgb_color(HERB_RGB), "herbivores  (grazers, color = lineage)");
+    sy += 26.0;
     swatch(sy, rgb_color(PLANT_RGB), "plant biomass  (producers)");
     sy += 26.0;
     swatch(sy, rgb_color(SOIL_RGB), "soil nutrient  (decomposers)");
-    sy += 26.0;
-    swatch(sy, Color::new(0.22, 0.22, 0.21, 1.0), "obstacle");
     sy += 34.0;
 
-    let note = "producer base self-regulates to a patchy plateau: the foundation the trophic pyramid stands on.";
+    let note = "herbivores graze the meadow, breed on surplus energy, and starve when it thins; plants and grazers coexist in a self-sustaining cycle, corpses feeding the soil.";
     for (i, line) in wrap_text(note, w - 2.0 * pad, 14).iter().enumerate() {
         draw_text(line, x + pad, sy + i as f32 * 17.0, 14.0, MUTED);
     }

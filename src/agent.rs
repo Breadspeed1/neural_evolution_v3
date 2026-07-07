@@ -6,6 +6,10 @@ pub mod binary_util;
 pub struct Agent {
     pub genome: Vec<u32>,
     pub pos: (u32, u32),
+    /// Lineage id: the index of this agent's founding ancestor at the initial
+    /// generation (or extinction reseed). Inherited verbatim by children, so all
+    /// descendants of one founder share an id. Used only for viewer coloring.
+    pub lineage: u32,
     brain: Brain,
     rgba: [u8; 4],
     amt_inners: u8
@@ -16,6 +20,7 @@ impl Clone for Agent {
         Agent {
             pos: self.pos,
             genome: self.genome.clone(),
+            lineage: self.lineage,
             brain: self.brain.clone(),
             rgba: self.get_rgba(),
             amt_inners: self.amt_inners
@@ -24,14 +29,27 @@ impl Clone for Agent {
 }
 
 impl Agent {
-    pub fn new(genome: &[u32], amt_inners: u8, pos: (u32, u32)) -> Agent {
+    pub fn new(genome: &[u32], amt_inners: u8, pos: (u32, u32), lineage: u32) -> Agent {
         Agent {
             pos,
             genome: genome.to_vec(),
+            lineage,
             brain: Brain::from(genome.to_vec(), amt_inners),
             rgba: Agent::calc_rgba(genome),
             amt_inners
         }
+    }
+
+    /// Read-only view of the decoded brain connections (for the viewer's brain
+    /// inspector). No serialization; purely for live introspection.
+    pub fn brain_connections(&self) -> &[Connection] {
+        &self.brain.connections
+    }
+
+    /// Read-only view of the brain's last neuron activations, indexed
+    /// `[layer][id]` with layer 0 = inputs (15), 1 = inner, 2 = outputs (5).
+    pub fn brain_neurons(&self) -> &[Vec<f32>] {
+        &self.brain.neurons
     }
 
     pub fn set_pos(&mut self, pos: (u32, u32)) {
@@ -55,7 +73,8 @@ impl Agent {
         Agent::new(
             &genome,
             self.amt_inners,
-            pos
+            pos,
+            self.lineage
         )
     }
 
@@ -260,12 +279,16 @@ impl Brain {
     }
 }
 
-struct Connection {
-    source_type: u8,
-    source_id: u8,
-    sink_type: u8,
-    sink_id: u8,
-    weight: f32
+/// A decoded synaptic connection. `source_type`/`sink_type` are layer tags:
+/// source 0 = input, 1 = inner; sink 1 = inner, 2 = output. Fields are public so
+/// the viewer's brain inspector can read the wiring; the struct is never
+/// serialized (the brain is a pure function of the genome).
+pub struct Connection {
+    pub source_type: u8,
+    pub source_id: u8,
+    pub sink_type: u8,
+    pub sink_id: u8,
+    pub weight: f32
 }
 
 impl Clone for Connection {

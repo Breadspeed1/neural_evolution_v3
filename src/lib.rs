@@ -173,6 +173,17 @@ fn barrier_row(y: u32, gaps: &[(u32, u32)], out: &mut Vec<Rect>) {
 }
 
 impl Challenge {
+    /// Human-readable name for the status panel.
+    pub fn name(self) -> &'static str {
+        match self {
+            Challenge::NorthBand => "north-band",
+            Challenge::Corners => "corners",
+            Challenge::Gauntlet => "gauntlet",
+            Challenge::MovingBand => "moving-band",
+            Challenge::Enclosure => "enclosure",
+        }
+    }
+
     /// Obstacle rectangles present in the world for `generation`.
     fn obstacles(self, _generation: u32) -> Vec<Rect> {
         match self {
@@ -260,16 +271,16 @@ pub struct Champion {
 /// `genome_diversity` is the mean pairwise Hamming distance (in bits, range
 /// 0..genome_length*32) over `DIVERSITY_SAMPLE_PAIRS` randomly sampled agent
 /// pairs, drawn from a dedicated RNG so measurement never perturbs the sim.
-#[derive(Serialize)]
-struct GenerationMetrics {
-    generation: u32,
-    survivors: u32,
-    survival_rate: f64,
-    extinction: bool,
-    mean_final_y: f64,
-    max_final_y: u32,
-    genome_diversity: f64,
-    wall_ms: f64,
+#[derive(Clone, Serialize)]
+pub struct GenerationMetrics {
+    pub generation: u32,
+    pub survivors: u32,
+    pub survival_rate: f64,
+    pub extinction: bool,
+    pub mean_final_y: f64,
+    pub max_final_y: u32,
+    pub genome_diversity: f64,
+    pub wall_ms: f64,
 }
 
 /// SplitMix64 finalizer — mixes an integer into a well-distributed seed.
@@ -310,6 +321,10 @@ pub struct Simulator {
     /// Optional genome to seed the initial population from (mutated copies).
     seed_genome: Option<Vec<u32>>,
     metrics_out: Option<File>,
+    /// In-memory per-generation metrics for the whole run so far, recorded
+    /// unconditionally (independent of `--metrics`). Small structs; a full run's
+    /// worth is a few KB. The viewer reads this for its live charts.
+    history: Vec<GenerationMetrics>,
     champion_path: Option<PathBuf>,
     champion_interval: u32,
 }
@@ -338,6 +353,7 @@ impl Simulator {
             gen_start: Instant::now(),
             seed_genome: None,
             metrics_out: None,
+            history: Vec::new(),
             champion_path: None,
             champion_interval: 0,
             config,
@@ -366,6 +382,23 @@ impl Simulator {
         self.seed_genome = Some(genome);
     }
 
+    /// Per-generation metrics recorded so far (always populated). The viewer's
+    /// survival/diversity charts read from this.
+    pub fn metrics_history(&self) -> &[GenerationMetrics] {
+        &self.history
+    }
+
+    /// The active selection environment.
+    pub fn challenge(&self) -> Challenge {
+        self.config.challenge
+    }
+
+    /// Whether `pos` lies in the survival zone for the current generation — the
+    /// pure survival predicate the viewer tints the world overlay from.
+    pub fn is_safe(&self, pos: (u32, u32)) -> bool {
+        self.config.challenge.survives(pos, self.generation)
+    }
+
     fn random_genome(&mut self) -> Vec<u32> {
         (0..self.config.genome_length)
             .map(|_| self.master_rng.random::<u32>())
@@ -388,8 +421,9 @@ impl Simulator {
                 }
                 None => self.random_genome(),
             };
+            // Lineage id = founder index at the initial generation.
             self.agents
-                .push(Agent::new(&genome, self.config.amount_inners as u8, pos));
+                .push(Agent::new(&genome, self.config.amount_inners as u8, pos, i));
         }
         self.add_obstacles();
         self.gen_start = Instant::now();
@@ -408,13 +442,15 @@ impl Simulator {
         // on a modulo-by-zero.
         if self.agents.is_empty() {
             let mut new_generation: Vec<Agent> = Vec::new();
-            for _ in 0..self.config.population {
+            for i in 0..self.config.population {
                 let pos = self.rand_pos();
                 let genome = self.random_genome();
+                // Fresh founders on reseed: lineage id = index again.
                 new_generation.push(Agent::new(
                     &genome,
                     self.config.amount_inners as u8,
                     pos,
+                    i,
                 ));
             }
             self.agents = new_generation;
@@ -616,7 +652,9 @@ impl Simulator {
         let mean_final_y = if n > 0 { sum_y as f64 / n as f64 } else { 0.0 };
         let survival_rate = if n > 0 { survivors as f64 / n as f64 } else { 0.0 };
 
-        let metrics = self.metrics_out.is_some().then(|| GenerationMetrics {
+        // Always record into the in-memory history (drives the live viewer),
+        // regardless of whether file output is enabled.
+        let m = GenerationMetrics {
             generation: self.generation,
             survivors,
             survival_rate,
@@ -625,13 +663,14 @@ impl Simulator {
             max_final_y,
             genome_diversity: self.genome_diversity(),
             wall_ms,
-        });
-        if let (Some(file), Some(m)) = (self.metrics_out.as_mut(), metrics) {
+        };
+        if let Some(file) = self.metrics_out.as_mut() {
             // Best-effort: a metrics write failure shouldn't kill a long run.
             if let Ok(line) = serde_json::to_string(&m) {
                 let _ = writeln!(file, "{}", line);
             }
         }
+        self.history.push(m);
 
         self.maybe_save_champion();
     }
@@ -935,6 +974,33 @@ mod tests {
         walled[65] |= 1u128 << 64; // wall at (65, 64), the east neighbor
         let inputs = calc_positional_inputs(&walled, &move_vectors, pos, &base, vec![9]);
         assert_eq!(inputs[9], 0.0, "east sensor should read 0.0 against a wall");
+    }
+
+    #[test]
+    fn lineage_assigned_at_founding_and_inherited() {
+        // Founders get their index as lineage id; a child inherits its parent's
+        // lineage verbatim (unchanged by mutation).
+        let mut sim = Simulator::new(test_config(99));
+        sim.generate_initial_generation();
+        for (i, a) in sim.agents.iter().enumerate() {
+            assert_eq!(a.lineage, i as u32, "founder {i} should have lineage {i}");
+        }
+        let parent = &sim.agents[7];
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        let child = parent.produce_child(0.5, (0, 0), &mut rng);
+        assert_eq!(child.lineage, parent.lineage, "child must inherit parent lineage");
+    }
+
+    #[test]
+    fn metrics_history_records_without_file_output() {
+        // History is populated every generation even with no --metrics file.
+        let mut sim = Simulator::new(test_config(5));
+        sim.generate_initial_generation();
+        while sim.generation < 3 {
+            sim.step();
+        }
+        assert_eq!(sim.metrics_history().len(), 3, "one record per completed generation");
+        assert_eq!(sim.metrics_history()[0].generation, 0);
     }
 
     #[test]

@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use macroquad::prelude::*;
 use neural_evolution::agent::Connection;
-use neural_evolution::{AgentView, Cli, Simulator, build_simulator};
+use neural_evolution::eco::EcoSim;
+use neural_evolution::grid::Cell;
+use neural_evolution::{AgentView, Cli, Mode, Simulator, build_eco_sim, build_simulator};
 
 fn window_conf() -> Conf {
     Conf {
@@ -19,9 +21,18 @@ fn window_conf() -> Conf {
 #[macroquad::main(window_conf)]
 async fn main() {
     let cli = Cli::parse();
-    let mut simulator = build_simulator(&cli);
-    let generations = cli.generations.unwrap_or(u32::MAX);
-    run_sim(&mut simulator, generations).await;
+    match cli.mode {
+        Mode::Challenge => {
+            let mut simulator = build_simulator(&cli);
+            let generations = cli.generations.unwrap_or(u32::MAX);
+            run_sim(&mut simulator, generations).await;
+        }
+        Mode::Eco => {
+            let mut eco = build_eco_sim(&cli);
+            let ticks = cli.ticks.unwrap_or(u64::MAX);
+            run_eco(&mut eco, ticks).await;
+        }
+    }
 }
 
 /// Speed model: a target number of sim steps per second. `q` halves it, `e`
@@ -54,6 +65,13 @@ const CRITICAL: Color = Color::new(208.0 / 255.0, 59.0 / 255.0, 59.0 / 255.0, 1.
 const WORLD_BG_PX: [u8; 4] = [17, 17, 16, 255]; // #111110
 const SAFE_PX: [u8; 4] = [15, 39, 15, 255]; // GOOD @ ~15% over world bg
 const OBSTACLE_PX: [u8; 4] = [56, 56, 53, 255]; // #383835
+
+// Eco-mode diorama tones. Nutrient is a subtle warm soil wash; biomass is a
+// green intensity. Both are blended over the dark world background per cell.
+const SOIL_RGB: [u8; 3] = [104, 74, 48]; // warm earthy brown
+const PLANT_RGB: [u8; 3] = [76, 196, 96]; // living green
+const PLANT_HUE: Color = Color::new(76.0 / 255.0, 196.0 / 255.0, 96.0 / 255.0, 1.0);
+const NUTRIENT_HUE: Color = Color::new(176.0 / 255.0, 138.0 / 255.0, 96.0 / 255.0, 1.0);
 
 const MARGIN: f32 = 14.0;
 /// How many recent positions each agent's motion trail retains.
@@ -332,6 +350,294 @@ async fn run_sim(simulator: &mut Simulator, generations: u32) {
         generations,
         now.elapsed().as_secs_f32() / 60.0
     );
+}
+
+// ===========================================================================
+// Eco mode (rung 1): the living meadow. A layered diorama on the shared dark
+// dashboard shell — nutrient as a warm soil wash, plant biomass as green — with
+// biomass/coverage sparklines. No agents yet; q/e speed and v display still work.
+// ===========================================================================
+
+/// The eco-mode dashboard loop. Advances the continuous terrarium (no
+/// generations — ticks run continuously) and renders the meadow each frame.
+async fn run_eco(eco: &mut EcoSim, ticks: u64) {
+    // Coarsen metrics recording so a long viewer session's history stays bounded
+    // (the headless runner keeps the default per-tick recording for its curve).
+    eco.set_metrics_interval(10);
+    eco.seed_initial();
+
+    let (gw, gh) = (eco.width(), eco.height());
+    let mut target_sps: f64 = 240.0;
+    let mut unlimited = false;
+    let mut display = true;
+    let mut step_accum: f64 = 0.0;
+
+    // Persistent texture sized to the grid, updated in place each frame.
+    let mut frame_image = Image::gen_image_color(gw as u16, gh as u16, WHITE);
+    let texture = Texture2D::from_image(&frame_image);
+    texture.set_filter(FilterMode::Nearest);
+
+    let mut last_frame = Instant::now();
+    let mut last_report = Instant::now();
+    let mut steps_since_report: u64 = 0;
+    let mut fps_smooth = 60.0;
+    let mut sps_smooth = 0.0;
+
+    // Optional smoke-test screenshot: grab one frame once the meadow has grown in.
+    let screenshot_path = std::env::var("NEURAL_SCREENSHOT").ok();
+    let mut shot = false;
+
+    while eco.tick_count() < ticks {
+        // --- input (mirrors the challenge viewer's speed / display controls) ---
+        if is_key_pressed(KeyCode::Q) {
+            if unlimited {
+                unlimited = false;
+                target_sps = UNLIMITED_THRESHOLD;
+            }
+            target_sps = (target_sps * 0.5).max(MIN_SPS);
+            println!("target {:.0} ticks/sec", target_sps);
+        }
+        if is_key_pressed(KeyCode::E) {
+            target_sps *= 2.0;
+            if target_sps >= UNLIMITED_THRESHOLD {
+                unlimited = true;
+                println!("target ticks/sec: unlimited");
+            } else {
+                println!("target {:.0} ticks/sec", target_sps);
+            }
+        }
+        if is_key_pressed(KeyCode::V) {
+            display = !display;
+            println!("display {}", if display { "on" } else { "off" });
+        }
+
+        // --- advance the meadow for this frame ---
+        let frame_start = Instant::now();
+        let dt = frame_start.duration_since(last_frame).as_secs_f64();
+        last_frame = frame_start;
+
+        let mut steps_this_frame: u64 = 0;
+        if !display || unlimited {
+            let budget = if display { DISPLAY_BUDGET } else { HEADLESS_BUDGET };
+            loop {
+                for _ in 0..64 {
+                    eco.tick();
+                    steps_this_frame += 1;
+                }
+                if frame_start.elapsed() >= budget {
+                    break;
+                }
+            }
+        } else {
+            step_accum += target_sps * dt;
+            let cap = (target_sps * 0.25).ceil().max(1.0);
+            let n = step_accum.floor().min(cap);
+            step_accum -= n;
+            for _ in 0..(n as u64) {
+                eco.tick();
+                steps_this_frame += 1;
+            }
+        }
+        steps_since_report += steps_this_frame;
+
+        if dt > 0.0 {
+            fps_smooth = fps_smooth * 0.9 + (1.0 / dt) * 0.1;
+            sps_smooth = sps_smooth * 0.9 + (steps_this_frame as f64 / dt) * 0.1;
+        }
+        if last_report.elapsed() >= Duration::from_secs(2) {
+            let secs = last_report.elapsed().as_secs_f64();
+            println!("~{:.0} ticks/sec", steps_since_report as f64 / secs);
+            steps_since_report = 0;
+            last_report = Instant::now();
+        }
+
+        // --- draw ---
+        clear_background(BG_PAGE);
+        if display {
+            let world_px = screen_height();
+            draw_eco_world(eco, world_px, &mut frame_image, &texture);
+            draw_eco_dashboard(eco, world_px, target_sps, unlimited, display, fps_smooth, sps_smooth);
+        }
+
+        if let Some(path) = &screenshot_path
+            && !shot
+            && eco.tick_count() >= 700
+        {
+            get_screen_data().export_png(path);
+            println!("screenshot saved to {path}");
+            shot = true;
+        }
+        next_frame().await;
+    }
+}
+
+/// Composite the meadow into the grid-sized texture (nutrient wash + plant green
+/// + obstacles) and blit it into the world square with nearest-neighbour scaling.
+fn draw_eco_world(eco: &EcoSim, world_px: f32, image: &mut Image, texture: &Texture2D) {
+    let p = eco.params();
+    let (soil_cap, biomass_max) = (p.soil_cap.max(1e-6), p.biomass_max.max(1e-6));
+    let pixels = image.get_image_data_mut();
+    for (px, cell) in pixels.iter_mut().zip(eco.cells()) {
+        *px = eco_pixel(cell, soil_cap, biomass_max);
+    }
+    texture.update(image);
+    draw_texture_ex(
+        texture,
+        0.0,
+        0.0,
+        WHITE,
+        DrawTextureParams {
+            dest_size: Some(vec2(world_px, world_px)),
+            ..Default::default()
+        },
+    );
+}
+
+/// One cell's diorama pixel: obstacles solid, otherwise the dark world with a
+/// subtle warm soil wash (∝ nutrient) under a green plant layer (∝ √biomass, so
+/// sparse seedlings still read).
+fn eco_pixel(cell: &Cell, soil_cap: f32, biomass_max: f32) -> [u8; 4] {
+    if cell.obstacle {
+        return OBSTACLE_PX;
+    }
+    let mut px = WORLD_BG_PX;
+    let na = (cell.nutrient / soil_cap).clamp(0.0, 1.0) * 0.30;
+    px = blend_px(px, SOIL_RGB, na);
+    let bt = (cell.biomass / biomass_max).clamp(0.0, 1.0).sqrt();
+    blend_px(px, PLANT_RGB, 0.92 * bt)
+}
+
+/// The eco dashboard column: status, coverage + biomass sparklines, a layers
+/// legend, and the keybind strip. Reuses the shared panel/sparkline helpers.
+fn draw_eco_dashboard(
+    eco: &EcoSim,
+    world_px: f32,
+    target_sps: f64,
+    unlimited: bool,
+    display: bool,
+    fps: f64,
+    sps: f64,
+) {
+    draw_line(world_px, 0.0, world_px, screen_height(), 1.0, HAIRLINE);
+
+    let col_x = world_px + MARGIN;
+    let col_w = (screen_width() - world_px - 2.0 * MARGIN).max(120.0);
+    let mut y = MARGIN;
+
+    // Corner HUD over the world.
+    let hud = format!("{:.0} fps   {:.0} ticks/s", fps, sps);
+    let dim = measure_text(&hud, None, 15, 1.0);
+    draw_text(&hud, world_px - dim.width - 12.0, 20.0, 15.0, MUTED);
+
+    let status_h = 168.0;
+    draw_eco_status_panel(eco, col_x, y, col_w, status_h, target_sps, unlimited, display);
+    y += status_h + MARGIN;
+
+    let spark_h = 128.0;
+    let coverage: Vec<f32> = eco.metrics_history().iter().map(|m| m.coverage as f32).collect();
+    draw_sparkline(col_x, y, col_w, spark_h, &coverage, Some((0.0, 1.0)), "coverage", PLANT_HUE, true, "{:.0}%", 100.0);
+    y += spark_h + MARGIN;
+
+    let biomass: Vec<f32> = eco.metrics_history().iter().map(|m| m.total_biomass as f32).collect();
+    draw_sparkline(col_x, y, col_w, spark_h, &biomass, None, "biomass", NUTRIENT_HUE, false, "{:.0}", 1.0);
+    y += spark_h + MARGIN;
+
+    // Keybind strip pinned to the bottom.
+    let legend = "q/e speed  ·  v display";
+    let legend_h = 26.0;
+    let legend_y = screen_height() - MARGIN - legend_h;
+    draw_text(legend, col_x, legend_y + 17.0, 14.0, MUTED);
+
+    // Layers legend fills the remaining space above the keybinds.
+    let layers_h = (legend_y - MARGIN - y).max(80.0);
+    draw_eco_layers_panel(col_x, y, col_w, layers_h);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_eco_status_panel(
+    eco: &EcoSim,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    target_sps: f64,
+    unlimited: bool,
+    display: bool,
+) {
+    draw_panel(x, y, w, h);
+    let pad = MARGIN;
+    draw_header("status", x + pad, y + 22.0);
+
+    let m = eco.latest();
+    let coverage = m.map(|m| m.coverage).unwrap_or(0.0);
+    let biomass = m.map(|m| m.total_biomass).unwrap_or(0.0);
+    let nutrient = m.map(|m| m.mean_nutrient).unwrap_or(0.0);
+    let speed = if unlimited { "unlimited".to_string() } else { format!("{:.0}/s", target_sps) };
+
+    let label_x = x + pad;
+    let value_x = x + pad + 118.0;
+    let row_h = 20.0;
+    let mut ly = y + 46.0;
+    let row = |label: &str, value: &str, vcol: Color, ly: &mut f32| {
+        draw_text(label, label_x, *ly, 17.0, MUTED);
+        draw_text(value, value_x, *ly, 17.0, vcol);
+        *ly += row_h;
+    };
+    row("mode", "eco  ·  terrarium", TEXT_SECONDARY, &mut ly);
+    row("tick", &eco.tick_count().to_string(), TEXT_PRIMARY, &mut ly);
+    row("coverage", &format!("{:.1}%", coverage * 100.0), TEXT_PRIMARY, &mut ly);
+    row("biomass", &format!("{biomass:.0}"), TEXT_SECONDARY, &mut ly);
+    row("nutrient", &format!("{nutrient:.3} mean"), TEXT_SECONDARY, &mut ly);
+    row("speed", &format!("{speed}   display {}", if display { "on" } else { "off" }), TEXT_SECONDARY, &mut ly);
+}
+
+/// A small caption panel keying the diorama's layers to their colors.
+fn draw_eco_layers_panel(x: f32, y: f32, w: f32, h: f32) {
+    draw_panel(x, y, w, h);
+    let pad = MARGIN;
+    draw_header("layers", x + pad, y + 22.0);
+
+    let swatch = |sy: f32, col: Color, label: &str| {
+        draw_rectangle(x + pad, sy - 10.0, 14.0, 14.0, col);
+        draw_rectangle_lines(x + pad, sy - 10.0, 14.0, 14.0, 1.0, HAIRLINE);
+        draw_text(label, x + pad + 24.0, sy + 2.0, 16.0, TEXT_SECONDARY);
+    };
+    let mut sy = y + 52.0;
+    swatch(sy, rgb_color(PLANT_RGB), "plant biomass  (producers)");
+    sy += 26.0;
+    swatch(sy, rgb_color(SOIL_RGB), "soil nutrient  (decomposers)");
+    sy += 26.0;
+    swatch(sy, Color::new(0.22, 0.22, 0.21, 1.0), "obstacle");
+    sy += 34.0;
+
+    let note = "producer base self-regulates to a patchy plateau: the foundation the trophic pyramid stands on.";
+    for (i, line) in wrap_text(note, w - 2.0 * pad, 14).iter().enumerate() {
+        draw_text(line, x + pad, sy + i as f32 * 17.0, 14.0, MUTED);
+    }
+}
+
+/// A macroquad `Color` from an `[r,g,b]` byte triple.
+fn rgb_color(c: [u8; 3]) -> Color {
+    Color::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0)
+}
+
+/// Greedy word-wrap to a pixel width at the given font size (for the caption).
+fn wrap_text(text: &str, max_w: f32, font_size: u16) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        let trial = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
+        if measure_text(&trial, None, font_size, 1.0).width > max_w && !cur.is_empty() {
+            lines.push(cur);
+            cur = word.to_string();
+        } else {
+            cur = trial;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    lines
 }
 
 /// Append the current agent positions as the newest trail sample, capped to

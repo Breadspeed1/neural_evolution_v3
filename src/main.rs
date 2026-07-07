@@ -8,6 +8,10 @@ use crate::agent::Agent;
 
 mod agent;
 
+/// Y coordinate an agent must exceed at generation end to survive and
+/// reproduce. The barrier obstacle sits on this row.
+const SURVIVAL_Y: u32 = 108;
+
 fn window_conf() -> Conf {
     Conf {
         window_title: "Neural Evolution".to_owned(),
@@ -26,7 +30,7 @@ async fn main() {
     let population: u32 = 1000;
     let generate_gifs: bool = false;
     let obstacles: Vec<((u32, u32), (u32, u32))> = vec![
-        ((10, 108), (118, 108)),
+        ((10, SURVIVAL_Y), (118, SURVIVAL_Y)),
         /*((10, 107), (10, 20)),
         ((118, 107), (118, 20))*/
     ];
@@ -215,6 +219,25 @@ impl Simulator {
 
         self.generation += 1;
         self.remove_losers();
+
+        // Extinction: no survivors means there is nothing to reproduce from.
+        // Reseed the generation with fresh random genomes instead of crashing
+        // on a modulo-by-zero.
+        if self.agents.is_empty() {
+            println!("extinction at generation {} - reseeding with random genomes", self.generation);
+            let mut new_generation: Vec<Agent> = Vec::new();
+            for _ in 0..self.population {
+                let pos: (u32, u32) = self.rand_pos();
+                new_generation.push(Agent::new(
+                    &self.random_genome(),
+                    self.amount_inners as u8,
+                    pos
+                ));
+            }
+            self.agents = new_generation;
+            return;
+        }
+
         let mut new_generation: Vec<Agent> = Vec::new();
 
         for i in 0..self.population {
@@ -230,9 +253,9 @@ impl Simulator {
 
     fn rand_pos(&mut self) -> (u32, u32) {
         let mut rand = ::rand::rng();
-        let mut pos: (u32, u32) = (rand.random_range(0..127), rand.random_range(0..127));
+        let mut pos: (u32, u32) = (rand.random_range(0..=127), rand.random_range(0..=127));
         while self.get_pos(pos) {
-            pos = (rand.random_range(0..127), rand.random_range(0..127));
+            pos = (rand.random_range(0..=127), rand.random_range(0..=127));
         }
         self.toggle_pos(pos);
 
@@ -264,7 +287,7 @@ impl Simulator {
 
         for agent in &mut *self.agents {
             let pos = agent.get_pos();
-            if pos.1 > 108 {
+            if pos.1 > SURVIVAL_Y {
                 winners.push(agent.clone());
             }
         }
@@ -360,10 +383,13 @@ impl Simulator {
         let mut av: (u32, u32) = (0, 0);
 
         for a in &mut *self.agents {
-            av = (av.0 + a.get_pos().0, av.0 + a.get_pos().0);
+            av = (av.0 + a.get_pos().0, av.1 + a.get_pos().1);
         }
 
-        av = (av.0 / self.agents.len() as u32, av.1 / self.agents.len() as u32);
+        let n = self.agents.len() as u32;
+        if n > 0 {
+            av = (av.0 / n, av.1 / n);
+        }
 
         inputs[0] = 0.0;
         inputs[1] = 1.0;

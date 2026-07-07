@@ -17,10 +17,21 @@ use hecs::Entity;
 /// One grid cell: a static obstacle flag plus the creature currently on it (if
 /// any). "Blocked" for collision purposes means either — a wall or a creature
 /// both block movement onto the cell.
+///
+/// `nutrient` and `biomass` are the per-cell ecosystem fields (rung 1's
+/// producer base, see [`crate::eco`]). They default to `0.0` and are **never
+/// touched by the generational challenge sim**, so adding them is
+/// behavior-preserving there; only the eco mode reads and writes them.
 #[derive(Clone, Default)]
 pub struct Cell {
     pub obstacle: bool,
     pub occupant: Option<Entity>,
+    /// Soil nutrient level (the decomposer/bacteria layer). Diffuses slowly and
+    /// replenishes toward a soil capacity; consumed by plant growth.
+    pub nutrient: f32,
+    /// Standing plant biomass (the producer layer). Grows where nutrient is
+    /// plentiful, spreads to neighbors by seeding, and decays slowly.
+    pub biomass: f32,
 }
 
 impl Cell {
@@ -84,6 +95,8 @@ impl Grid {
         for c in &mut self.cells {
             c.obstacle = false;
             c.occupant = None;
+            c.nutrient = 0.0;
+            c.biomass = 0.0;
         }
     }
 

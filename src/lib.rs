@@ -15,6 +15,7 @@ use crate::agent::{Agent, Connection, mutate_genome};
 use crate::grid::Grid;
 
 pub mod agent;
+pub mod eco;
 pub mod grid;
 
 /// A creature's grid position, kept as its own hecs component: spatial queries
@@ -35,11 +36,30 @@ pub struct AgentView {
     pub lineage: u32,
 }
 
+/// Which simulation to run. `challenge` is the generational neural-net evolution
+/// sim (the default, unchanged); `eco` is the continuous, generation-less
+/// terrarium (rung 1: the nutrient + plant producer base, see [`crate::eco`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum Mode {
+    #[default]
+    Challenge,
+    Eco,
+}
+
 /// Command-line configuration shared by both binaries (viewer + headless).
 /// Defaults reproduce the original hardcoded values.
 #[derive(Parser)]
 #[command(about = "Genome-encoded neural-net evolution simulator")]
 pub struct Cli {
+    /// Which simulation to run: the generational `challenge` sim (default) or
+    /// the continuous `eco` terrarium.
+    #[arg(long, value_enum, default_value_t = Mode::Challenge)]
+    pub mode: Mode,
+    /// Eco mode only: stop after this many ticks (headless; default: run
+    /// indefinitely). Ignored in challenge mode (which uses `--generations`).
+    #[arg(long)]
+    pub ticks: Option<u64>,
     /// Number of agents per generation.
     #[arg(long, default_value_t = 1000)]
     pub population: u32,
@@ -132,6 +152,25 @@ pub fn build_simulator(cli: &Cli) -> Simulator {
     }
     if let Some(path) = &cli.save_champion {
         sim.set_champion(path.clone(), cli.champion_interval);
+    }
+    sim
+}
+
+/// Build a configured eco-mode [`EcoSim`] from parsed CLI args (world size,
+/// seed, metrics). Reuses `resolve_seed` and `--world-size`; the meadow's
+/// dynamics are the tuned [`eco::EcoParams`] defaults. Does not seed the initial
+/// meadow — call [`eco::EcoSim::seed_initial`] after.
+pub fn build_eco_sim(cli: &Cli) -> eco::EcoSim {
+    let seed = resolve_seed(cli.seed);
+    let size = cli.world_size as usize;
+    let mut sim = eco::EcoSim::new(eco::EcoConfig {
+        width: size,
+        height: size,
+        seed,
+        params: eco::EcoParams::default(),
+    });
+    if let Some(path) = &cli.metrics {
+        sim.set_metrics(path).expect("failed to open --metrics file");
     }
     sim
 }
@@ -432,8 +471,9 @@ pub struct GenerationMetrics {
     pub wall_ms: f64,
 }
 
-/// SplitMix64 finalizer — mixes an integer into a well-distributed seed.
-fn mix(mut z: u64) -> u64 {
+/// SplitMix64 finalizer — mixes an integer into a well-distributed seed. Shared
+/// with the eco module's per-cell RNG derivation.
+pub(crate) fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)

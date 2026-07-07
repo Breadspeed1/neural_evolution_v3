@@ -71,6 +71,46 @@ Every step in this roadmap obeys the inversion of that mistake:
   renders a layered diorama (subtle soil wash ∝ nutrient, green ∝ √biomass) with
   biomass + coverage sparklines on the shared dark shell. This producer base is
   what rung 2's herbivores (hecs entities with energy) will graze.
+- **Ecosystem terrarium — herbivores** *(rung 2 of the ecosystem ladder;
+  `--mode eco`)*: the first **mobile trophic level** and the project's first
+  **generation-less birth/death evolution** — individuals with an energy budget
+  who forage, reproduce, and die with **no global fitness function**. Herbivores
+  are **hecs entities** (`Position` + a `Herbivore` bundle of genome/brain/energy/
+  lineage) reusing the challenge sim's sparse-genome feed-forward [`Brain`], now
+  width-parametric, over a **12-input forager sensorium** (bias, oscillator, own
+  energy, random, biomass-here, a 2-axis biomass gradient, 4 directional
+  blocked-neighbor sensors, and local herbivore density) → the same movement
+  outputs. Each tick is (1) the rung-1 parallel field CA, then (2) a **serial,
+  order-stable entity phase**: per herbivore in birth `order`, sense → brain →
+  move (costs energy, blocked by the grid) → **graze** (biomass→energy up to a
+  cap and a satiation headroom, depleting the cell) → pay **metabolism** → then
+  **die** (energy ≤ 0 ⇒ despawn, body → a nutrient pulse in the cell, closing the
+  loop herbivore→soil→plant) or **reproduce** (energy ≥ threshold ⇒ a
+  `mutate_genome` child on an empty neighbor, energy split in half). Determinism
+  is preserved exactly as the `Simulator`: a stable `order: Vec<Entity>` (append
+  on birth, `retain` on death), position-in-`order` as the per-entity RNG index,
+  a per-entity `herbivore_seed(seed, tick, index)` stream (domain-tagged so it
+  never aliases the plant CA's `cell_seed`), and the parallel field phase strictly
+  separated from the serial entity phase — **two same-seed runs are byte-identical
+  JSONL** (verified by diff). `EcoMetrics` gains population / births / deaths /
+  mean-energy (the Lotka–Volterra readout); the viewer draws the grazers as
+  bright lineage-colored creatures on the meadow with a **population sparkline**
+  beside coverage + biomass. **Coexistence gate met** (seed 42, 128², defaults,
+  no reseeding): from 150 founders the meadow blooms (coverage 0.9%→**53%** by
+  tick 200), grazers boom in its wake (150→**2523** by tick 500) and crash the
+  bloom (coverage **53%→19%** by tick 1000) — one clear predator-prey cycle —
+  after which plants and herbivores **relax to a persistent steady state**
+  (coverage ~12%, biomass ~1000, **~1600–2000 grazers**, mean energy ~3.3,
+  births≈deaths) that **self-sustains to 40 000 ticks without collapsing or
+  exploding**, robust across seeds (42/7/123 all settle to the same band). The
+  balance: metabolism (0.02) vs graze-cap×coverage sets a per-tick energy budget
+  that is *marginally* positive on the patchy meadow, so the grazer count is
+  pinned by food, not runaway; large energy reserves (`energy_max` 10, satiation
+  headroom on grazing, `repro_threshold` 7) keep grazers off the starvation edge
+  — that reserve buffer is what makes coexistence robust rather than a knife-edge.
+  Sustained *global* oscillation stays damped (the producer base's own strong
+  self-regulation plus spatial averaging over 16 384 cells), so what persists is
+  a stable coexistence with an opening cycle rather than a limit cycle.
 - **Core sim**: parallel (rayon) step, seeded ChaCha8 determinism (reproducible
   across the parallel decision phase), geometric-skip mutation.
 - **Harness**: lib + headless/viewer bins, clap CLI, per-generation JSONL
@@ -166,6 +206,15 @@ itself.
 *Gate: a foraging strategy measurably outperforms a random walker; population
 shows density-dependent dynamics.*
 
+*Landed via the ecosystem ladder (rung 2, `--mode eco`): survival is now purely
+behavioral (graze or starve) with generation-less energy-driven birth/death, and
+the population shows clear density-dependent dynamics — a founder bloom, a boom
+that crashes its own food, then a self-sustaining plant↔herbivore coexistence
+(see "Where we are"). Foraging-strategy-beats-random-walker is implicit (better
+foragers leave more offspring, so lineages that ignore the food gradient are
+selected out), but is not yet isolated as a paired baseline curve; the continuous
+sub-cell world / smooth shapes remain the one unbuilt piece of this gate.*
+
 ### 5. Pheromone / stigmergy layer
 A diffusing scalar field agents deposit into and sense (another `Vec<f32>` grid,
 like the world). This is how ants form trails with no central control — and it is
@@ -183,6 +232,17 @@ from memory (3) and signaling fields (5).
 
 *Gate: coupled population dynamics (Lotka–Volterra-like oscillation) and at least
 one evolved pursuit or evasion behavior.*
+
+*Now concretely the **next eco rung (rung 3)**: add a carnivore trophic level on
+top of rung 2's herbivores — the coupled plant↔herbivore dynamics and the
+byte-identical serial-entity-phase machinery are already in place, so rung 3 is a
+second entity species that senses + eats herbivores (prey energy → predator
+energy, closing the pyramid). The rung-2 handoff seams for it: herbivores already
+carry energy + lineage and die into the nutrient field; a predator reuses the
+same `Position` + brain-bundle + `order`/`herbivore_seed` determinism pattern,
+adds a "nearest prey" sensor, and turns a catch into an energy transfer + a
+herbivore death. CTRNN brains (roadmap 3) and the pheromone field (roadmap 5)
+compose with it but are not prerequisites.*
 
 ### Deferred / lower priority
 - **Communication channels** (an output other agents can sense): evolvable

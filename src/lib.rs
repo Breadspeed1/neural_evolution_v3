@@ -10,8 +10,10 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{Agent, mutate_genome};
+use crate::grid::Grid;
 
 pub mod agent;
+pub mod grid;
 
 /// Command-line configuration shared by both binaries (viewer + headless).
 /// Defaults reproduce the original hardcoded values.
@@ -54,6 +56,11 @@ pub struct Cli {
     /// Selection environment (obstacle layout + survival predicate).
     #[arg(long, value_enum, default_value_t = Challenge::NorthBand)]
     pub challenge: Challenge,
+    /// Side length of the (square) world grid. Defaults to 128; the challenges
+    /// hardcode 128-grid coordinates, so scaling is not advertised yet — the
+    /// representation is size-parametric but the survival zones are not.
+    #[arg(long, default_value_t = 128)]
+    pub world_size: u32,
     /// Headless only: run 50 generations and print gens/sec, then exit.
     #[arg(long)]
     pub bench: bool,
@@ -69,6 +76,7 @@ impl Cli {
             steps_per_generation: self.steps,
             seed,
             challenge: self.challenge,
+            world_size: self.world_size,
         }
     }
 }
@@ -366,6 +374,16 @@ pub struct SimConfig {
     /// serialized champion, so those files still load.
     #[serde(default)]
     pub challenge: Challenge,
+    /// Side length of the square world grid. Defaults to 128 for older champions
+    /// (and the current default), which is what the challenge coordinates assume.
+    #[serde(default = "default_world_size")]
+    pub world_size: u32,
+}
+
+/// Default world side length (128), used for the `serde` default so champions
+/// serialized before `world_size` existed still load.
+fn default_world_size() -> u32 {
+    128
 }
 
 /// A saved champion: the best agent's genome plus the config that produced it.
@@ -418,7 +436,10 @@ const REPRO_TAG: u32 = u32::MAX;
 const DIVERSITY_TAG: u32 = u32::MAX - 1;
 
 pub struct Simulator {
-    pub world: Vec<u128>,
+    /// The spatial substrate: a typed cell grid (obstacles + occupancy) that
+    /// replaced the old `Vec<u128>` column bitmask. Private; the viewer builds
+    /// its terrain overlay from `obstacles` + `is_safe`, never from raw cells.
+    grid: Grid,
     pub agents: Vec<Agent>,
     pub generation: u32,
     current_steps: u32,
@@ -448,8 +469,9 @@ pub struct Simulator {
 impl Simulator {
     pub fn new(config: SimConfig) -> Simulator {
         let master_rng = ChaCha8Rng::seed_from_u64(config.seed);
+        let size = config.world_size as usize;
         Simulator {
-            world: vec![0; 128],
+            grid: Grid::new(size, size),
             agents: Vec::new(),
             generation: 0,
             current_steps: 0,
@@ -631,27 +653,25 @@ impl Simulator {
     fn rand_pos(&mut self) -> (u32, u32) {
         let challenge = self.config.challenge;
         let generation = self.generation;
+        let (max_x, max_y) = (self.grid.max_x() as u32, self.grid.max_y() as u32);
         let mut pos: (u32, u32) = (
-            self.master_rng.random_range(0..=127),
-            self.master_rng.random_range(0..=127),
+            self.master_rng.random_range(0..=max_x),
+            self.master_rng.random_range(0..=max_y),
         );
         while self.get_pos(pos) || challenge.survives(pos, generation) {
             pos = (
-                self.master_rng.random_range(0..=127),
-                self.master_rng.random_range(0..=127),
+                self.master_rng.random_range(0..=max_x),
+                self.master_rng.random_range(0..=max_y),
             );
         }
-        self.toggle_pos(pos);
+        self.grid.set_occupied(pos);
         pos
     }
 
-    fn toggle_pos(&mut self, coords: (u32, u32)) {
-        let mask = 2_u128.pow(coords.1);
-        self.world[coords.0 as usize] ^= mask;
-    }
-
+    /// Whether a cell is blocked (obstacle or another creature) — the occupancy
+    /// test the spawn reservation and collision resolver read.
     fn get_pos(&self, coords: (u32, u32)) -> bool {
-        (self.world[coords.0 as usize] >> coords.1) & 1 == 1
+        self.grid.blocked(coords)
     }
 
     /// Cull agents that failed survival this generation, using the precomputed
@@ -666,7 +686,7 @@ impl Simulator {
     }
 
     fn clear_world(&mut self) {
-        self.world = vec![0; 128];
+        self.grid.reset();
         self.add_obstacles();
     }
 
@@ -731,7 +751,10 @@ impl Simulator {
         }
 
         let inputs = self.calc_step_inputs();
-        let world_snapshot = self.world.clone();
+        // The grid is read (occupancy) but not mutated during the decision
+        // phase — mutation is confined to the serial application below — so the
+        // closures can borrow it directly instead of cloning a snapshot.
+        let grid = &self.grid;
         let move_vectors = self.move_vectors.clone();
         let seed = self.config.seed;
         let generation = self.generation;
@@ -746,7 +769,7 @@ impl Simulator {
                 let agent_pos = agent.get_pos();
                 let used = agent.get_used_inputs();
                 let all_inputs =
-                    calc_positional_inputs(&world_snapshot, &move_vectors, agent_pos, &inputs, used);
+                    calc_positional_inputs(grid, &move_vectors, agent_pos, &inputs, used);
                 let mut rng = ChaCha8Rng::seed_from_u64(agent_seed(seed, generation, step, i));
                 agent.step(all_inputs, &mut rng)
             })
@@ -756,17 +779,18 @@ impl Simulator {
         // `orbit` is the only challenge that needs path state; accumulate swept
         // angle here (serial => deterministic), and only when it's active.
         let track_angle = self.config.challenge == Challenge::Orbit;
+        let (max_x, max_y) = (self.grid.max_x(), self.grid.max_y());
         for (i, &translation) in translations.iter().enumerate() {
             let agent_pos: (u32, u32) = self.agents[i].get_pos();
             let pos: (u32, u32) = (
-                (agent_pos.0 as i32 + translation.0).clamp(0, 127) as u32,
-                (agent_pos.1 as i32 + translation.1).clamp(0, 127) as u32,
+                (agent_pos.0 as i32 + translation.0).clamp(0, max_x) as u32,
+                (agent_pos.1 as i32 + translation.1).clamp(0, max_y) as u32,
             );
 
             if !self.get_pos(pos) {
-                self.toggle_pos(agent_pos);
+                self.grid.clear_occupied(agent_pos);
                 self.agents[i].set_pos(pos);
-                self.toggle_pos(pos);
+                self.grid.set_occupied(pos);
                 if track_angle {
                     self.agents[i].add_angle(swept_angle(agent_pos, pos));
                 }
@@ -806,8 +830,8 @@ impl Simulator {
         inputs[2] = (self.current_steps % 2) as f32;
         inputs[3] = self.current_steps as f32 / self.config.steps_per_generation as f32;
         inputs[4] = self.master_rng.random_range(0.0..1.0);
-        inputs[5] = av.1 as f32 / 127.0;
-        inputs[6] = av.0 as f32 / 127.0;
+        inputs[5] = av.1 as f32 / self.grid.max_y() as f32;
+        inputs[6] = av.0 as f32 / self.grid.max_x() as f32;
 
         inputs
     }
@@ -816,12 +840,11 @@ impl Simulator {
     /// stamp it into the world.
     fn add_obstacles(&mut self) {
         let obstacles = self.config.challenge.obstacles(self.generation);
-        for obstacle in &obstacles {
-            let mut mask = 0u128;
-            (obstacle.0.1..=obstacle.1.1).for_each(|y| mask |= 1u128 << y);
-
-            for x in obstacle.0.0..=obstacle.1.0 {
-                self.world[x as usize] |= mask;
+        for &((x0, y0), (x1, y1)) in &obstacles {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    self.grid.set_obstacle((x, y));
+                }
             }
         }
         self.obstacles = obstacles;
@@ -918,18 +941,12 @@ impl Simulator {
     }
 }
 
-/// Read a single world cell from a snapshot (column-bitmask) world without
-/// needing `&mut Simulator`, so the decision phase can run in parallel.
-#[inline]
-fn world_get(world: &[u128], coords: (u32, u32)) -> bool {
-    (world[coords.0 as usize] >> coords.1) & 1 == 1
-}
-
 /// Build an agent's full input vector: the shared base inputs (7), the 8
-/// directional "can I move here" sensors, and the 2 self-position sensors,
-/// read against a world snapshot. Total width 17.
+/// directional "can I move here" sensors, and the 2 self-position sensors, read
+/// against the grid (occupancy is not mutated during the decision phase, so the
+/// grid can be shared across the parallel closures). Total width 17.
 fn calc_positional_inputs(
-    world: &[u128],
+    grid: &Grid,
     move_vectors: &[(i32, i32)],
     pos: (u32, u32),
     base: &[f32],
@@ -937,6 +954,7 @@ fn calc_positional_inputs(
 ) -> Vec<f32> {
     let mut copy = base.to_vec();
     copy.extend_from_slice(&[0.0; 10]);
+    let (max_x, max_y) = (grid.max_x(), grid.max_y());
 
     // Obstacle sensors 7..=14 are computed lazily — only for the ids the brain
     // actually reads (`used`). The position sensors 15/16 can also appear in
@@ -949,17 +967,18 @@ fn calc_positional_inputs(
         }
         let vec: (i32, i32) = move_vectors[i - 7];
         let neighbor = (
-            (pos.0 as i32 + vec.0).clamp(0, 127) as u32,
-            (pos.1 as i32 + vec.1).clamp(0, 127) as u32,
+            (pos.0 as i32 + vec.0).clamp(0, max_x) as u32,
+            (pos.1 as i32 + vec.1).clamp(0, max_y) as u32,
         );
-        copy[i] = if world_get(world, neighbor) { 0.0 } else { 1.0 };
+        copy[i] = if grid.blocked(neighbor) { 0.0 } else { 1.0 };
     }
 
     // Self-position sensors, always populated (position is always "used", unlike
     // the lazy obstacle sensors): normalized (x, y) so a brain can navigate to
-    // absolute coordinates rather than only follow the crowd or walls.
-    copy[15] = pos.0 as f32 / 127.0;
-    copy[16] = pos.1 as f32 / 127.0;
+    // absolute coordinates rather than only follow the crowd or walls. At the
+    // default 128 grid `max_x`/`max_y` are 127, matching the original /127.0.
+    copy[15] = pos.0 as f32 / max_x as f32;
+    copy[16] = pos.1 as f32 / max_y as f32;
 
     copy
 }
@@ -977,6 +996,7 @@ mod tests {
             steps_per_generation: 50,
             seed,
             challenge: Challenge::NorthBand,
+            world_size: 128,
         }
     }
 
@@ -1108,11 +1128,11 @@ mod tests {
         let base = vec![0.0f32; 7];
         // (10,107): solid barrier cell directly north -> blocked (0.0).
         let blocked =
-            calc_positional_inputs(&sim.world, &move_vectors, (10, 107), &base, vec![7]);
+            calc_positional_inputs(&sim.grid, &move_vectors, (10, 107), &base, vec![7]);
         assert_eq!(blocked[7], 0.0, "north sensor should read blocked below solid barrier");
         // (40,107): a gap sits directly north -> open (1.0).
         let open =
-            calc_positional_inputs(&sim.world, &move_vectors, (40, 107), &base, vec![7]);
+            calc_positional_inputs(&sim.grid, &move_vectors, (40, 107), &base, vec![7]);
         assert_eq!(open[7], 1.0, "north sensor should read open below a gap");
     }
 
@@ -1173,12 +1193,12 @@ mod tests {
         let base = vec![0.0f32; 7];
         let pos = (64u32, 64u32);
 
-        let open = vec![0u128; 128];
+        let open = Grid::new(128, 128);
         let inputs = calc_positional_inputs(&open, &move_vectors, pos, &base, vec![9]);
         assert_eq!(inputs[9], 1.0, "east sensor should read 1.0 in open space");
 
-        let mut walled = vec![0u128; 128];
-        walled[65] |= 1u128 << 64; // wall at (65, 64), the east neighbor
+        let mut walled = Grid::new(128, 128);
+        walled.set_obstacle((65, 64)); // wall at (65, 64), the east neighbor
         let inputs = calc_positional_inputs(&walled, &move_vectors, pos, &base, vec![9]);
         assert_eq!(inputs[9], 0.0, "east sensor should read 0.0 against a wall");
     }
@@ -1249,7 +1269,7 @@ mod tests {
             (0, 1), (0, -1), (1, 0), (1, 1), (1, -1), (-1, 0), (-1, 1), (-1, -1),
         ];
         let base = vec![0.0f32; 7];
-        let world = vec![0u128; 128];
+        let world = Grid::new(128, 128);
         let pos = (32u32, 96u32);
         let inputs = calc_positional_inputs(&world, &move_vectors, pos, &base, vec![]);
         assert_eq!(inputs.len(), 17, "input vector should be widened to 17");

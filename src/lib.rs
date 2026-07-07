@@ -130,15 +130,17 @@ pub enum Challenge {
     /// are unchanged.
     #[default]
     NorthBand,
-    /// Survive iff the final position lies within radius 20 of any of the four
+    /// Survive iff the final position lies within radius 10 of any of the four
     /// world corners. A 33x33 obstacle block fills the center (x,y∈[48,80]) to
     /// discourage clumping and give the directional sensors something to read.
     /// Selects for dispersal and a committed directional preference.
     Corners,
     /// Survive iff final `y > 108`, but the barrier on row y=108 spans the full
-    /// width x∈[0,127] with only three width-5 gaps (centered near x=24, 63,
-    /// 102). Agents starting below must locate and pass through a gap, so this
-    /// selects for real navigation off the directional obstacle sensors.
+    /// width x∈[0,127] with only two narrow gaps (width 3, centered near x=40
+    /// and x=88). Unlike NorthBand there are no open flanks: the only way north
+    /// is through a gap, so an agent starting below must locate and thread one.
+    /// Pure "go north" drift rarely lands on a gap within the step budget, so
+    /// this selects for real navigation off the directional obstacle sensors.
     Gauntlet,
     /// Survive iff the final `y` is within 10 of a band center that oscillates
     /// with the generation number: `center = round(64 + 24*sin(0.25*gen))`,
@@ -148,11 +150,26 @@ pub enum Challenge {
     /// robust centering strategies.
     MovingBand,
     /// Survive iff the final position is strictly inside a central walled box:
-    /// walls of thickness 1 form the square x,y∈[44,84] with a width-9 entrance
-    /// gap in the bottom wall (x∈[60,68], y=44). Safe interior is x,y∈[45,83].
+    /// walls of thickness 1 form the square x,y∈[44,84] with a width-15 entrance
+    /// gap in the bottom wall (x∈[57,71], y=44). Safe interior is x,y∈[45,83].
     /// Selects for seeking the box and threading the single entrance, using the
     /// directional sensors to follow walls.
     Enclosure,
+}
+
+/// Append the solid segments of a full-width barrier on row `y` (x∈[0,127])
+/// with the given inclusive `gaps` left open, to `out`.
+fn barrier_row(y: u32, gaps: &[(u32, u32)], out: &mut Vec<Rect>) {
+    let mut x = 0u32;
+    for &(g0, g1) in gaps {
+        if x < g0 {
+            out.push(((x, y), (g0 - 1, y)));
+        }
+        x = g1 + 1;
+    }
+    if x <= 127 {
+        out.push(((x, y), (127, y)));
+    }
 }
 
 impl Challenge {
@@ -162,20 +179,11 @@ impl Challenge {
             Challenge::NorthBand => vec![((10, SURVIVAL_Y), (118, SURVIVAL_Y))],
             Challenge::Corners => vec![((48, 48), (80, 80))],
             Challenge::Gauntlet => {
-                // Full-width barrier on row SURVIVAL_Y with three gaps.
-                let y = SURVIVAL_Y;
-                let gaps = [(22u32, 26u32), (61, 65), (100, 104)];
-                let mut segs: Vec<Rect> = Vec::new();
-                let mut x = 0u32;
-                for (g0, g1) in gaps {
-                    if x < g0 {
-                        segs.push(((x, y), (g0 - 1, y)));
-                    }
-                    x = g1 + 1;
-                }
-                if x <= 127 {
-                    segs.push(((x, y), (127, y)));
-                }
+                // Full-width barrier on row SURVIVAL_Y with two width-3 gaps
+                // (centered near x=40 and x=88). The narrow openings are the
+                // only way north, forcing navigation to a gap.
+                let mut segs = Vec::new();
+                barrier_row(SURVIVAL_Y, &[(39, 41), (87, 89)], &mut segs);
                 segs
             }
             Challenge::MovingBand => vec![],
@@ -183,8 +191,8 @@ impl Challenge {
                 ((44, 84), (84, 84)), // top wall
                 ((44, 44), (44, 84)), // left wall
                 ((84, 44), (84, 84)), // right wall
-                ((44, 44), (59, 44)), // bottom wall, left of entrance
-                ((69, 44), (84, 44)), // bottom wall, right of entrance
+                ((44, 44), (56, 44)), // bottom wall, left of entrance
+                ((72, 44), (84, 44)), // bottom wall, right of entrance
             ],
         }
     }
@@ -199,7 +207,7 @@ impl Challenge {
         match self {
             Challenge::NorthBand | Challenge::Gauntlet => pos.1 > SURVIVAL_Y,
             Challenge::Corners => {
-                const R2: i32 = 20 * 20;
+                const R2: i32 = 10 * 10;
                 let corners = [(0i32, 0i32), (0, 127), (127, 0), (127, 127)];
                 corners.iter().any(|&(cx, cy)| {
                     let dx = pos.0 as i32 - cx;
@@ -438,12 +446,20 @@ impl Simulator {
         self.gen_start = Instant::now();
     }
 
+    /// Reserve a unique spawn cell: unoccupied AND outside the current
+    /// challenge's survival zone. Excluding the survival zone stops agents from
+    /// spawning on a free win — they must move to earn survival, so gen-0
+    /// numbers reflect behavior rather than lucky placement. Uses the master
+    /// seeded RNG (deterministic) and the survival predicate for the generation
+    /// the spawned agent will live through (`self.generation`).
     fn rand_pos(&mut self) -> (u32, u32) {
+        let challenge = self.config.challenge;
+        let generation = self.generation;
         let mut pos: (u32, u32) = (
             self.master_rng.random_range(0..=127),
             self.master_rng.random_range(0..=127),
         );
-        while self.get_pos(pos) {
+        while self.get_pos(pos) || challenge.survives(pos, generation) {
             pos = (
                 self.master_rng.random_range(0..=127),
                 self.master_rng.random_range(0..=127),
@@ -770,13 +786,17 @@ mod tests {
 
     #[test]
     fn gauntlet_gaps_are_open_and_barrier_blocks() {
-        // The three gap centers on the barrier row are passable; a between-gap
-        // cell is solid. This is what forces navigation.
+        // The three gap centers on the barrier row are passable; the barrier is
+        // solid everywhere else, including the flanks (x=0 and x=127) that
+        // NorthBand leaves open. This is what forces navigation to a gap.
         let sim = world_for(Challenge::Gauntlet);
-        for gap_x in [24u32, 63, 102] {
+        for gap_x in [40u32, 88] {
             assert!(!sim.get_pos((gap_x, SURVIVAL_Y)), "gap at x={gap_x} is blocked");
         }
         assert!(sim.get_pos((10, SURVIVAL_Y)), "barrier between gaps should be solid");
+        assert!(sim.get_pos((64, SURVIVAL_Y)), "center should be solid between the two gaps");
+        assert!(sim.get_pos((0, SURVIVAL_Y)), "west flank should be solid (no open edge)");
+        assert!(sim.get_pos((127, SURVIVAL_Y)), "east flank should be solid (no open edge)");
     }
 
     #[test]
@@ -786,6 +806,68 @@ mod tests {
         let sim = world_for(Challenge::Enclosure);
         assert!(!sim.get_pos((64, 44)), "entrance cell should be open");
         assert!(sim.get_pos((50, 44)), "bottom wall beside entrance should be solid");
+    }
+
+    #[test]
+    fn champion_json_round_trips_challenge() {
+        // A saved champion carries its challenge through serialization, and an
+        // older champion file with no `challenge` field loads as NorthBand.
+        let mut cfg = test_config(3);
+        cfg.challenge = Challenge::Gauntlet;
+        let champ = Champion { config: cfg, genome: vec![1, 2, 3] };
+        let json = serde_json::to_string(&champ).unwrap();
+        assert!(json.contains("\"challenge\":\"gauntlet\""), "kebab-case challenge in JSON: {json}");
+        let back: Champion = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.config.challenge, Challenge::Gauntlet);
+
+        let legacy = r#"{"config":{"population":1,"genome_length":1,"amount_inners":1,"mutation_rate":0.001,"steps_per_generation":1,"seed":1},"genome":[0]}"#;
+        let back: Champion = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back.config.challenge, Challenge::NorthBand, "missing challenge defaults to NorthBand");
+    }
+
+    #[test]
+    fn spawns_never_land_in_survival_zone() {
+        // The spawn-exclusion fix: no agent may start already satisfying the
+        // survival predicate for the generation it will live through. Checked
+        // for every challenge across the initial generation.
+        for challenge in [
+            Challenge::NorthBand,
+            Challenge::Corners,
+            Challenge::Gauntlet,
+            Challenge::MovingBand,
+            Challenge::Enclosure,
+        ] {
+            let mut cfg = test_config(7);
+            cfg.challenge = challenge;
+            let mut sim = Simulator::new(cfg);
+            sim.generate_initial_generation();
+            for a in &sim.agents {
+                assert!(
+                    !challenge.survives(a.get_pos(), 0),
+                    "{challenge:?}: agent spawned inside survival zone at {:?}",
+                    a.get_pos()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gauntlet_north_sensor_reads_barrier() {
+        // In the actual Gauntlet world, an agent just below the barrier reads
+        // its north directional sensor (id 7 -> move_vectors[0] = (0,1)) as 0.0
+        // where the barrier is solid and 1.0 where a gap sits above — confirming
+        // the directional obstacle sensors fire against the challenge's walls.
+        let sim = world_for(Challenge::Gauntlet);
+        let move_vectors = sim.move_vectors.clone();
+        let base = vec![0.0f32; 7];
+        // (10,107): solid barrier cell directly north -> blocked (0.0).
+        let blocked =
+            calc_positional_inputs(&sim.world, &move_vectors, (10, 107), &base, vec![7]);
+        assert_eq!(blocked[7], 0.0, "north sensor should read blocked below solid barrier");
+        // (40,107): a gap sits directly north -> open (1.0).
+        let open =
+            calc_positional_inputs(&sim.world, &move_vectors, (40, 107), &base, vec![7]);
+        assert_eq!(open[7], 1.0, "north sensor should read open below a gap");
     }
 
     #[test]

@@ -112,6 +112,66 @@ pub fn build_simulator(cli: &Cli) -> Simulator {
 /// reproduce. The barrier obstacle sits on this row.
 pub const SURVIVAL_Y: u32 = 108;
 
+/// Grid center used by the position-based pattern challenges (ring, heart,
+/// orbit). The 128×128 grid's cells run 0..=127; 64 is one of the four central
+/// cells (chosen and used consistently).
+const CENTER: (i32, i32) = (64, 64);
+
+/// `flock`: max distance from the population's final centroid to survive. Kept
+/// tight (a single blob) yet ≥ ~18, the radius a disk needs to actually hold all
+/// ~1000 collision-separated agents, so full convergence stays feasible.
+const FLOCK_RADIUS: i32 = 20;
+/// `ring`: inner/outer radii of the survival annulus about the center. A
+/// hollow ring; the hole (r < RING_R_IN) is what forces the pattern.
+const RING_R_IN: i32 = 22;
+const RING_R_OUT: i32 = 42;
+/// `heart`: scale (grid cells per normalized unit) of the embedded heart curve.
+/// Larger = bigger heart. Tuned so the shape reads clearly and gen-0 survival
+/// stays in a climbable range.
+const HEART_SCALE: f32 = 34.0;
+/// `orbit`: radius band the agent must end within, and the minimum absolute
+/// swept angle required to count as having orbited. A half-turn (π) is the
+/// natural target but leaves gen-0 near 0.2% (fragile); 2.0 rad (~115°) is still
+/// clearly sustained rotation while lifting the gen-0 floor for a robust climb.
+const ORBIT_R_IN: i32 = 14;
+const ORBIT_R_OUT: i32 = 50;
+const ORBIT_THETA: f32 = 2.0;
+
+/// Squared distance from a cell to the grid center — the shared kernel for the
+/// radius-based pattern challenges (avoids a sqrt).
+fn dist2_center(pos: (u32, u32)) -> i32 {
+    let dx = pos.0 as i32 - CENTER.0;
+    let dy = pos.1 as i32 - CENTER.1;
+    dx * dx + dy * dy
+}
+
+/// The signed angle (radians, wrapped to (−π, π]) swept about the grid center
+/// as a cell moves from `old` to `new`. Single-cell moves usually subtend a
+/// small angle; the wrap covers the rare large sweep close to the center. The
+/// center is offset by 0.5 so no cell sits exactly on it (atan2 stays defined).
+fn swept_angle(old: (u32, u32), new: (u32, u32)) -> f32 {
+    let cx = CENTER.0 as f32 - 0.5;
+    let cy = CENTER.1 as f32 - 0.5;
+    let a0 = (old.1 as f32 - cy).atan2(old.0 as f32 - cx);
+    let a1 = (new.1 as f32 - cy).atan2(new.0 as f32 - cx);
+    let mut d = a1 - a0;
+    if d > std::f32::consts::PI {
+        d -= std::f32::consts::TAU;
+    } else if d < -std::f32::consts::PI {
+        d += std::f32::consts::TAU;
+    }
+    d
+}
+
+/// `orbit` survival: a completed half-turn (by accumulated signed angle) and a
+/// final radius inside the band. Kept as a free function so the unit test and
+/// the simulator's dynamic-survival path share one definition.
+fn orbit_survives(pos: (u32, u32), accumulated_angle: f32) -> bool {
+    let r2 = dist2_center(pos);
+    accumulated_angle.abs() >= ORBIT_THETA
+        && (ORBIT_R_IN * ORBIT_R_IN..=ORBIT_R_OUT * ORBIT_R_OUT).contains(&r2)
+}
+
 /// A rectangle of obstacle cells: ((x0, y0), (x1, y1)), inclusive on both ends.
 type Rect = ((u32, u32), (u32, u32));
 
@@ -155,6 +215,30 @@ pub enum Challenge {
     /// Selects for seeking the box and threading the single entrance, using the
     /// directional sensors to follow walls.
     Enclosure,
+    /// Pattern-forming (dynamic): survive iff the final position lies within
+    /// `FLOCK_RADIUS` of the population's own *final* centroid (the mean of all
+    /// agents' end positions, computed once at generation end). There is no fixed
+    /// zone — the target is wherever the crowd gathers — so it selects purely for
+    /// convergence into a single tight blob. Needs the self-position sensor to
+    /// steer toward the crowd rather than drift.
+    Flock,
+    /// Pattern-forming (static): survive iff the distance from the grid center is
+    /// in the annulus `[RING_R_IN, RING_R_OUT]`. Selects the swarm into a hollow
+    /// ring — agents must hold a target radius, neither collapsing to the center
+    /// nor fleeing to the edge.
+    Ring,
+    /// Pattern-forming (static): survive iff the final position lies inside an
+    /// embedded heart, defined analytically by the implicit curve
+    /// `(nx²+ny²−1)³ − nx²·ny³ ≤ 0` over grid coordinates normalized about the
+    /// center (y flipped so the heart sits upright). The showpiece: the swarm is
+    /// sculpted into a filled heart. `HEART_SCALE` sets its size.
+    Heart,
+    /// Pattern-forming (dynamic): survive iff the agent has swept at least
+    /// `ORBIT_THETA` radians of signed angle around the grid center over the
+    /// generation *and* ends in the radius band `[ORBIT_R_IN, ORBIT_R_OUT]`.
+    /// Rewards sustained rotation rather than a spiral in/out, selecting for a
+    /// pinwheel. Uses each agent's per-generation accumulated-angle path state.
+    Orbit,
 }
 
 /// Append the solid segments of a full-width barrier on row `y` (x∈[0,127])
@@ -181,6 +265,10 @@ impl Challenge {
             Challenge::Gauntlet => "gauntlet",
             Challenge::MovingBand => "moving-band",
             Challenge::Enclosure => "enclosure",
+            Challenge::Flock => "flock",
+            Challenge::Ring => "ring",
+            Challenge::Heart => "heart",
+            Challenge::Orbit => "orbit",
         }
     }
 
@@ -205,6 +293,9 @@ impl Challenge {
                 ((44, 44), (56, 44)), // bottom wall, left of entrance
                 ((72, 44), (84, 44)), // bottom wall, right of entrance
             ],
+            // The pattern-forming challenges shape the swarm with the survival
+            // predicate alone — no obstacles.
+            Challenge::Flock | Challenge::Ring | Challenge::Heart | Challenge::Orbit => vec![],
         }
     }
 
@@ -233,6 +324,26 @@ impl Challenge {
             Challenge::Enclosure => {
                 (45..=83).contains(&pos.0) && (45..=83).contains(&pos.1)
             }
+            Challenge::Ring => {
+                let d2 = dist2_center(pos);
+                (RING_R_IN * RING_R_IN..=RING_R_OUT * RING_R_OUT).contains(&d2)
+            }
+            Challenge::Heart => {
+                // Normalized coordinates about the center, y flipped so the
+                // heart sits upright (lobes up, point down) on screen. Inside
+                // the implicit heart curve => survive (a filled heart).
+                let nx = (pos.0 as f32 - CENTER.0 as f32) / HEART_SCALE;
+                let ny = (CENTER.1 as f32 - pos.1 as f32) / HEART_SCALE;
+                let t = nx * nx + ny * ny - 1.0;
+                t * t * t - nx * nx * ny * ny * ny <= 0.0
+            }
+            // Dynamic challenges: survival depends on more than a single final
+            // position (Flock on the crowd's centroid, Orbit on per-agent swept
+            // angle), so it is resolved in `Simulator::eval_survival`, not here.
+            // Returning false gives them no static zone — which is exactly right
+            // for spawn-exclusion (nothing to exclude) and the viewer tint (no
+            // fixed target to draw).
+            Challenge::Flock | Challenge::Orbit => false,
         }
     }
 }
@@ -443,22 +554,28 @@ impl Simulator {
     }
 
     fn spawn_next_generation(&mut self) {
-        // Record metrics / champion for the generation that just finished.
-        self.record_generation();
-
         let lived_gen = self.generation;
+        // Resolve survival once for the generation just finished — including the
+        // dynamic challenges' whole-population context (flock's centroid, orbit's
+        // per-agent swept angle) — and reuse the same flags for metrics, the
+        // viewer snapshot, and culling. Order matches `self.agents`.
+        let survived = self.eval_survival(lived_gen);
+
+        // Record metrics / champion for the generation that just finished.
+        self.record_generation(&survived);
+
         // Snapshot final positions + survival before culling, for the viewer's
         // turnover pulse. Cheap: one (u32,u32,bool) per agent, overwritten each
         // generation. Independent of the RNG, so determinism is unaffected.
-        let challenge = self.config.challenge;
         self.last_final.clear();
         self.last_final.extend(
             self.agents
                 .iter()
-                .map(|a| (a.get_pos(), challenge.survives(a.get_pos(), lived_gen))),
+                .zip(&survived)
+                .map(|(a, &s)| (a.get_pos(), s)),
         );
         self.generation += 1;
-        self.remove_losers(lived_gen);
+        self.remove_losers(&survived);
 
         // Extinction: no survivors means there is nothing to reproduce from.
         // Reseed the generation with fresh random genomes instead of crashing
@@ -537,18 +654,64 @@ impl Simulator {
         (self.world[coords.0 as usize] >> coords.1) & 1 == 1
     }
 
-    /// Cull agents that failed the survival predicate for the generation they
-    /// just lived through (`lived_gen`), then reset the world with obstacles for
-    /// the upcoming generation.
-    fn remove_losers(&mut self, lived_gen: u32) {
-        let challenge = self.config.challenge;
-        self.agents.retain(|a| challenge.survives(a.get_pos(), lived_gen));
+    /// Cull agents that failed survival this generation, using the precomputed
+    /// per-agent `survived` flags (aligned with `self.agents`), then reset the
+    /// world with obstacles for the upcoming generation. Taking the flags rather
+    /// than re-deriving them keeps the dynamic challenges (flock/orbit) evaluated
+    /// exactly once and consistent with the recorded metrics.
+    fn remove_losers(&mut self, survived: &[bool]) {
+        let mut keep = survived.iter();
+        self.agents.retain(|_| *keep.next().unwrap_or(&false));
         self.clear_world();
     }
 
     fn clear_world(&mut self) {
         self.world = vec![0; 128];
         self.add_obstacles();
+    }
+
+    /// Per-agent survival flags for the just-finished generation, in
+    /// `self.agents` order. Static challenges defer to the pure `survives`
+    /// predicate; the dynamic ones resolve their whole-population context here,
+    /// once: `flock` against the crowd's final centroid, `orbit` against each
+    /// agent's accumulated swept angle plus final radius band.
+    fn eval_survival(&self, generation: u32) -> Vec<bool> {
+        match self.config.challenge {
+            Challenge::Flock => {
+                let c = self.agents_centroid();
+                let r2 = FLOCK_RADIUS * FLOCK_RADIUS;
+                self.agents
+                    .iter()
+                    .map(|a| {
+                        let p = a.get_pos();
+                        let dx = p.0 as i32 - c.0 as i32;
+                        let dy = p.1 as i32 - c.1 as i32;
+                        dx * dx + dy * dy <= r2
+                    })
+                    .collect()
+            }
+            Challenge::Orbit => self
+                .agents
+                .iter()
+                .map(|a| orbit_survives(a.get_pos(), a.accumulated_angle()))
+                .collect(),
+            challenge => self
+                .agents
+                .iter()
+                .map(|a| challenge.survives(a.get_pos(), generation))
+                .collect(),
+        }
+    }
+
+    /// Mean position (centroid) of the current agents. `flock`'s survival zone
+    /// is a disk about this point, so the target is wherever the crowd gathers.
+    fn agents_centroid(&self) -> (u32, u32) {
+        let n = self.agents.len().max(1) as u32;
+        let sum = self.agents.iter().fold((0u32, 0u32), |acc, a| {
+            let p = a.get_pos();
+            (acc.0 + p.0, acc.1 + p.1)
+        });
+        (sum.0 / n, sum.1 / n)
     }
 
     /// Advance the simulation one step.
@@ -590,6 +753,9 @@ impl Simulator {
             .collect();
 
         // (b) serial application phase
+        // `orbit` is the only challenge that needs path state; accumulate swept
+        // angle here (serial => deterministic), and only when it's active.
+        let track_angle = self.config.challenge == Challenge::Orbit;
         for (i, &translation) in translations.iter().enumerate() {
             let agent_pos: (u32, u32) = self.agents[i].get_pos();
             let pos: (u32, u32) = (
@@ -601,6 +767,9 @@ impl Simulator {
                 self.toggle_pos(agent_pos);
                 self.agents[i].set_pos(pos);
                 self.toggle_pos(pos);
+                if track_angle {
+                    self.agents[i].add_angle(swept_angle(agent_pos, pos));
+                }
             }
         }
 
@@ -661,17 +830,11 @@ impl Simulator {
     /// Compute + emit metrics for the just-finished generation, and save the
     /// champion if it's on the save interval. Uses `self.generation` (not yet
     /// incremented) and the current agents.
-    fn record_generation(&mut self) {
+    fn record_generation(&mut self, survived: &[bool]) {
         let wall_ms = self.gen_start.elapsed().as_secs_f64() * 1000.0;
         let n = self.agents.len();
 
-        let challenge = self.config.challenge;
-        let cur_gen = self.generation;
-        let survivors = self
-            .agents
-            .iter()
-            .filter(|a| challenge.survives(a.get_pos(), cur_gen))
-            .count() as u32;
+        let survivors = survived.iter().filter(|&&s| s).count() as u32;
         let max_final_y = self.agents.iter().map(|a| a.get_pos().1).max().unwrap_or(0);
         let sum_y: u64 = self.agents.iter().map(|a| a.get_pos().1 as u64).sum();
         let mean_final_y = if n > 0 { sum_y as f64 / n as f64 } else { 0.0 };
@@ -915,6 +1078,10 @@ mod tests {
             Challenge::Gauntlet,
             Challenge::MovingBand,
             Challenge::Enclosure,
+            Challenge::Flock,
+            Challenge::Ring,
+            Challenge::Heart,
+            Challenge::Orbit,
         ] {
             let mut cfg = test_config(7);
             cfg.challenge = challenge;
@@ -1088,5 +1255,100 @@ mod tests {
         assert_eq!(inputs.len(), 17, "input vector should be widened to 17");
         assert_eq!(inputs[15], 32.0 / 127.0, "input 15 = self x / 127");
         assert_eq!(inputs[16], 96.0 / 127.0, "input 16 = self y / 127");
+    }
+
+    #[test]
+    fn ring_survives_only_in_the_annulus() {
+        // A point mid-annulus survives; the hollow center and the region past
+        // the outer radius both die.
+        let c = Challenge::Ring;
+        let mid = (RING_R_IN + RING_R_OUT) / 2;
+        assert!(
+            c.survives(((CENTER.0 + mid) as u32, CENTER.1 as u32), 0),
+            "mid-annulus point should survive"
+        );
+        assert!(
+            !c.survives((CENTER.0 as u32, CENTER.1 as u32), 0),
+            "the hollow center should die"
+        );
+        assert!(
+            !c.survives(((CENTER.0 + RING_R_OUT + 6) as u32, CENTER.1 as u32), 0),
+            "outside the outer radius should die"
+        );
+    }
+
+    #[test]
+    fn heart_contains_center_and_excludes_far_corner() {
+        // The implicit heart is filled and contains the grid center; a far
+        // corner lies well outside it.
+        let c = Challenge::Heart;
+        assert!(
+            c.survives((CENTER.0 as u32, CENTER.1 as u32), 0),
+            "grid center should be inside the heart"
+        );
+        assert!(!c.survives((2, 2), 0), "far corner should be outside the heart");
+    }
+
+    #[test]
+    fn orbit_requires_half_turn_and_radius_band() {
+        // In the radius band with a completed half-turn (either sign) survives;
+        // too little swept angle fails; outside the band fails even if orbited.
+        let mid_r = (ORBIT_R_IN + ORBIT_R_OUT) / 2;
+        let in_band = ((CENTER.0 + mid_r) as u32, CENTER.1 as u32);
+        assert!(orbit_survives(in_band, ORBIT_THETA + 0.1), "half-turn in band survives");
+        assert!(orbit_survives(in_band, -(ORBIT_THETA + 0.1)), "sign of the sweep shouldn't matter");
+        assert!(!orbit_survives(in_band, ORBIT_THETA - 0.5), "insufficient swept angle fails");
+        let outside = ((CENTER.0 + ORBIT_R_OUT + 5) as u32, CENTER.1 as u32);
+        assert!(!orbit_survives(outside, ORBIT_THETA + 1.0), "outside the band fails even if well-orbited");
+    }
+
+    #[test]
+    fn flock_survival_tracks_the_crowd_centroid() {
+        // Flock's survival zone is a disk about the population's own centroid.
+        // A dense crowd at the center pins the centroid there: an agent in the
+        // blob survives, one in the far corner does not.
+        let mut cfg = test_config(1);
+        cfg.challenge = Challenge::Flock;
+        let mut sim = Simulator::new(cfg);
+        let genome = vec![0u32; 8];
+        let mut agents: Vec<Agent> =
+            (0..20).map(|_| Agent::new(&genome, 8, (64, 64), 0)).collect();
+        agents.push(Agent::new(&genome, 8, (64, 64), 0)); // index 20: in the blob
+        agents.push(Agent::new(&genome, 8, (120, 120), 0)); // index 21: far away
+        sim.agents = agents;
+        let survived = sim.eval_survival(0);
+        assert!(survived[20], "an agent inside the crowd blob should survive flock");
+        assert!(!survived[21], "an agent far from the crowd centroid should not");
+    }
+
+    #[test]
+    fn orbit_run_is_deterministic() {
+        // The new per-agent swept-angle path state is updated in the serial
+        // phase, so two identically seeded orbit runs must match bit-for-bit,
+        // positions and accumulated angles alike.
+        let mk = || {
+            let mut c = test_config(2024);
+            c.challenge = Challenge::Orbit;
+            Simulator::new(c)
+        };
+        let mut a = mk();
+        let mut b = mk();
+        a.generate_initial_generation();
+        b.generate_initial_generation();
+        for _ in 0..120 {
+            a.step();
+            b.step();
+        }
+        let fa: Vec<_> = a
+            .agents
+            .iter()
+            .map(|x| (x.get_pos(), x.accumulated_angle().to_bits()))
+            .collect();
+        let fb: Vec<_> = b
+            .agents
+            .iter()
+            .map(|x| (x.get_pos(), x.accumulated_angle().to_bits()))
+            .collect();
+        assert_eq!(fa, fb, "orbit run diverged under an identical seed");
     }
 }

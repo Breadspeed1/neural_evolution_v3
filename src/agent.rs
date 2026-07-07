@@ -10,6 +10,14 @@ pub struct Agent {
     /// generation (or extinction reseed). Inherited verbatim by children, so all
     /// descendants of one founder share an id. Used only for viewer coloring.
     pub lineage: u32,
+    /// Signed angle (radians) accumulated around the grid center over this
+    /// generation's steps — the running sum of the angle swept between old and
+    /// new position each time the agent moves. Starts at 0 for every freshly
+    /// constructed agent (so it resets at spawn / generation start) and is only
+    /// advanced by the `orbit` challenge's serial application phase. Not
+    /// serialized; the genome fully determines the brain, this is transient path
+    /// state.
+    accumulated_angle: f32,
     brain: Brain,
     rgba: [u8; 4],
     amt_inners: u8
@@ -21,6 +29,7 @@ impl Clone for Agent {
             pos: self.pos,
             genome: self.genome.clone(),
             lineage: self.lineage,
+            accumulated_angle: self.accumulated_angle,
             brain: self.brain.clone(),
             rgba: self.get_rgba(),
             amt_inners: self.amt_inners
@@ -34,6 +43,7 @@ impl Agent {
             pos,
             genome: genome.to_vec(),
             lineage,
+            accumulated_angle: 0.0,
             brain: Brain::from(genome.to_vec(), amt_inners),
             rgba: Agent::calc_rgba(genome),
             amt_inners
@@ -58,6 +68,18 @@ impl Agent {
 
     pub fn get_pos(&self) -> (u32, u32) {
         self.pos
+    }
+
+    /// Signed angle (radians) accumulated around the grid center this
+    /// generation. Read by the `orbit` challenge's survival predicate.
+    pub fn accumulated_angle(&self) -> f32 {
+        self.accumulated_angle
+    }
+
+    /// Add `delta` radians to the accumulated orbit angle. Called only from the
+    /// serial application phase (so it stays deterministic) when the agent moves.
+    pub fn add_angle(&mut self, delta: f32) {
+        self.accumulated_angle += delta;
     }
 
     pub fn get_used_inputs(&mut self) -> Vec<usize> {

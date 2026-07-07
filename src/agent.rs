@@ -1,9 +1,8 @@
 use rand::RngExt;
-use serde::{Serialize};
+use rand_chacha::ChaCha8Rng;
 
-mod binary_util;
+pub mod binary_util;
 
-#[derive(Serialize)]
 pub struct Agent {
     pub genome: Vec<u32>,
     pub pos: (u32, u32),
@@ -25,11 +24,11 @@ impl Clone for Agent {
 }
 
 impl Agent {
-    pub fn new(genome: &Vec<u32>, amt_inners: u8, pos: (u32, u32)) -> Agent {
+    pub fn new(genome: &[u32], amt_inners: u8, pos: (u32, u32)) -> Agent {
         Agent {
             pos,
-            genome: genome.clone(),
-            brain: Brain::from(genome.clone(), amt_inners),
+            genome: genome.to_vec(),
+            brain: Brain::from(genome.to_vec(), amt_inners),
             rgba: Agent::calc_rgba(genome),
             amt_inners
         }
@@ -47,12 +46,12 @@ impl Agent {
         self.brain.get_used_inputs()
     }
 
-    pub fn step(&mut self, input: Vec<f32>) -> (i32, i32) {
-        self.brain.step(input)
+    pub fn step(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
+        self.brain.step(input, rng)
     }
 
-    pub fn produce_child(&self, mutation_rate: f32, pos: (u32, u32)) -> Agent {
-        let genome = self.mutate_genome(mutation_rate);
+    pub fn produce_child(&self, mutation_rate: f32, pos: (u32, u32), rng: &mut ChaCha8Rng) -> Agent {
+        let genome = mutate_genome(&self.genome, mutation_rate, rng);
         Agent::new(
             &genome,
             self.amt_inners,
@@ -64,7 +63,7 @@ impl Agent {
         self.rgba
     }
 
-    pub fn calc_rgba(genome: &Vec<u32>) -> [u8; 4] {
+    pub fn calc_rgba(genome: &[u32]) -> [u8; 4] {
         let mut av: f32 = 0.0;
         genome.iter().for_each(|x| av += *x as f32);
         let bits = av.to_bits();
@@ -77,44 +76,43 @@ impl Agent {
         ]
     }
 
-    /// Flip each bit of the genome independently with probability
-    /// `mutation_rate` (matching the original per-bit trial), but instead of
-    /// rolling the RNG once per bit we sample the gaps between flipped bits
-    /// from a geometric distribution. For the default rate (0.001) this turns
-    /// ~8192 RNG calls per agent into ~8, with the identical flip distribution.
-    fn mutate_genome(&self, mutation_rate: f32) -> Vec<u32> {
-        let mut out: Vec<u32> = self.genome.clone();
-        let p = mutation_rate as f64;
-        if p <= 0.0 {
-            return out;
-        }
-
-        let mut rng = rand::rng();
-        let total_bits = out.len() * 32;
-        let ln_1mp = (1.0 - p).ln();
-        let mut pos: usize = 0;
-
-        loop {
-            // Number of bits that are *not* flipped before the next flip:
-            // geometric with success probability p.
-            let u: f64 = rng.random::<f64>();
-            let skip_f = u.ln() / ln_1mp;
-            if !skip_f.is_finite() {
-                break;
-            }
-            pos = pos.saturating_add(skip_f.floor() as usize);
-            if pos >= total_bits {
-                break;
-            }
-            out[pos / 32] = binary_util::flip(&out[pos / 32], pos % 32);
-            pos += 1;
-        }
-
-        out
-    }
 }
 
-#[derive(Serialize)]
+/// Flip each bit of the genome independently with probability
+/// `mutation_rate` (matching the original per-bit trial), but instead of
+/// rolling the RNG once per bit we sample the gaps between flipped bits
+/// from a geometric distribution. For the default rate (0.001) this turns
+/// ~8192 RNG calls per agent into ~8, with the identical flip distribution.
+pub fn mutate_genome(genome: &[u32], mutation_rate: f32, rng: &mut ChaCha8Rng) -> Vec<u32> {
+    let mut out: Vec<u32> = genome.to_vec();
+    let p = mutation_rate as f64;
+    if p <= 0.0 {
+        return out;
+    }
+
+    let total_bits = out.len() * 32;
+    let ln_1mp = (1.0 - p).ln();
+    let mut pos: usize = 0;
+
+    loop {
+        // Number of bits that are *not* flipped before the next flip:
+        // geometric with success probability p.
+        let u: f64 = rng.random::<f64>();
+        let skip_f = u.ln() / ln_1mp;
+        if !skip_f.is_finite() {
+            break;
+        }
+        pos = pos.saturating_add(skip_f.floor() as usize);
+        if pos >= total_bits {
+            break;
+        }
+        out[pos / 32] = binary_util::flip(&out[pos / 32], pos % 32);
+        pos += 1;
+    }
+
+    out
+}
+
 struct Brain {
     genome: Vec<u32>,
     move_activation: f32,
@@ -162,7 +160,7 @@ impl Brain {
         out
     }
 
-    fn step(&mut self, input: Vec<f32>) -> (i32, i32) {
+    fn step(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
         self.reset_all();
         self.neurons[0] = input;
         self.calculate_all();
@@ -170,8 +168,7 @@ impl Brain {
         let mut request = (0, 0);
 
         if self.neurons[2][0] > self.move_activation {
-            let mut rand = rand::rng();
-            request = (request.0 + rand.random_range(-1..=1), request.1 + rand.random_range(-1..=1));
+            request = (request.0 + rng.random_range(-1..=1), request.1 + rng.random_range(-1..=1));
         }
 
         let move_vec: Vec<(i32, i32)> = vec![
@@ -227,7 +224,7 @@ impl Brain {
             self.generate_connection_from_genome_segment(i);
         }
 
-        self.connections.sort_by(|a, b| a.sink_id.cmp(&b.sink_id));
+        self.connections.sort_by_key(|a| a.sink_id);
     }
 
     fn generate_connection_from_genome_segment(&mut self, index: usize) {
@@ -238,20 +235,17 @@ impl Brain {
         let sink_type: u8 = binary_util::get_segment(&dec, /*&(0b10000000100000000000000000000000 as u32)*/ 7..=7) as u8 + 1;
         let sink_id: u8 = binary_util::get_segment(&dec, /*&(0b10000000011111110000000000000000 as u32)*/8..=15) as u8 % self.neurons[sink_type as usize].len() as u8;
         //println!("{}", self.neurons[sink_type as usize].len());
-        let weight: f32;
+        let magnitude = binary_util::get_segment(&dec, 17..=31) as f32 / 16000.0;
+        let weight = if binary_util::get_segment(&dec, 16..=16) == 1 {
+            magnitude
+        } else {
+            -magnitude
+        };
 
-        if binary_util::get_segment(&dec, /*&(0b00000000000000001000000000000000 as u32)*/ 16..=16) == 1 {
-            weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / 16000.0;
-        }
-        else {
-            weight = binary_util::get_segment(&dec, /*&(0b00000000000000000111111111111111 as u32)*/ 17..=31) as f32 / -16000.0;
-        }
-
-        if source_type == 0 && source_id > 6 {
-            if !self.used_input_ids.contains(&(source_id as usize)) {
+        if source_type == 0 && source_id > 6
+            && !self.used_input_ids.contains(&(source_id as usize)) {
                 self.used_input_ids.push(source_id as usize);
             }
-        }
 
 
         //println!("{}-{} {}-{} {}", source_type, source_id, sink_type, sink_id, weight);
@@ -266,7 +260,6 @@ impl Brain {
     }
 }
 
-#[derive(Serialize)]
 struct Connection {
     source_type: u8,
     source_id: u8,
@@ -284,5 +277,63 @@ impl Clone for Connection {
             sink_id: self.sink_id,
             weight: self.weight
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn get_segment_extracts_bit_range() {
+        // 0b1011_0100 = 180; bits [2..=5] read low-first = 0b1101 = 13.
+        assert_eq!(binary_util::get_segment(&0b1011_0100u32, 2..=5), 13);
+        assert_eq!(binary_util::get_segment(&0xFFFF_FFFFu32, 0..=0), 1);
+        assert_eq!(binary_util::get_segment(&0u32, 0..=31), 0);
+    }
+
+    #[test]
+    fn flip_toggles_single_bit() {
+        assert_eq!(binary_util::flip(&0b0000u32, 2), 0b0100);
+        assert_eq!(binary_util::flip(&0b0100u32, 2), 0b0000);
+        assert_eq!(binary_util::flip(&0u32, 31), 1 << 31);
+    }
+
+    #[test]
+    fn gene_decodes_to_expected_connection() {
+        // Packing (bit 0 = LSB): [source_type:1][source_id:6][sink_type:1]
+        // [sink_id:8][sign:1][weight:15].
+        let dec: u32 = (5 << 1)                  // source_id = 5  (5 % 15 = 5)
+            | (1 << 7)               // sink_type raw = 1 -> decoded 2 (output, len 5)
+            | (3 << 8)               // sink_id = 3   (3 % 5 = 3)
+            | (1 << 16)              // sign = 1 -> positive
+            | (16000u32 << 17);      // weight raw = 16000 -> 16000/16000 = 1.0
+
+        let brain = Brain::from(vec![dec], 10);
+        assert_eq!(brain.connections.len(), 1);
+        let c = &brain.connections[0];
+        assert_eq!(c.source_type, 0);
+        assert_eq!(c.source_id, 5);
+        assert_eq!(c.sink_type, 2);
+        assert_eq!(c.sink_id, 3);
+        assert_eq!(c.weight, 1.0);
+    }
+
+    #[test]
+    fn mutation_frequency_matches_rate() {
+        // Geometric-skip mutation must reproduce the nominal per-bit flip rate.
+        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let rate = 0.01f32;
+        let genome = vec![0u32; 256]; // 8192 bits
+        let genomes = 200;
+        let mut flips: u64 = 0;
+        for _ in 0..genomes {
+            let mutated = mutate_genome(&genome, rate, &mut rng);
+            flips += mutated.iter().map(|g| g.count_ones() as u64).sum::<u64>();
+        }
+        let total_bits = (genome.len() * 32 * genomes) as f64;
+        let frac = flips as f64 / total_bits;
+        assert!((frac - rate as f64).abs() < 0.0005, "flip fraction {frac} off nominal {rate}");
     }
 }

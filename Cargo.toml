@@ -2,12 +2,15 @@
 name = "neural-evolution"
 version = "0.1.0"
 edition = "2024"
+default-run = "neural-evolution"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-image = "0.25.10"
+clap = { version = "4.6.1", features = ["derive"] }
 macroquad = "0.4.15"
 rand = "0.10.2"
+rand_chacha = "0.10.0"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"

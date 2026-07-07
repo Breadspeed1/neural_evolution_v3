@@ -163,16 +163,58 @@ pub fn build_simulator(cli: &Cli) -> Simulator {
 pub fn build_eco_sim(cli: &Cli) -> eco::EcoSim {
     let seed = resolve_seed(cli.seed);
     let size = cli.world_size as usize;
+    let mut params = eco::EcoParams::default();
+    apply_eco_env_overrides(&mut params);
     let mut sim = eco::EcoSim::new(eco::EcoConfig {
         width: size,
         height: size,
         seed,
-        params: eco::EcoParams::default(),
+        params,
     });
     if let Some(path) = &cli.metrics {
         sim.set_metrics(path).expect("failed to open --metrics file");
     }
     sim
+}
+
+/// Dev-only herbivore-tuning overrides read from the environment, applied only on
+/// the binary path (never by `EcoSim::new`, so the determinism tests and any
+/// unset run use the tuned [`eco::EcoParams`] defaults verbatim). Lets a headless
+/// parameter sweep explore the coexistence balance without a recompile, e.g.
+/// `ECO_GRAZE_CAP=0.3 ECO_METABOLISM=0.02 cargo run --bin headless -- --mode eco`.
+fn apply_eco_env_overrides(p: &mut eco::EcoParams) {
+    let f32v = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
+    let usizev = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    if let Some(v) = f32v("ECO_GRAZE_CAP") {
+        p.graze_cap = v;
+    }
+    if let Some(v) = f32v("ECO_GRAZE_EFF") {
+        p.graze_efficiency = v;
+    }
+    if let Some(v) = f32v("ECO_METABOLISM") {
+        p.metabolism = v;
+    }
+    if let Some(v) = f32v("ECO_MOVE_COST") {
+        p.move_cost = v;
+    }
+    if let Some(v) = f32v("ECO_REPRO") {
+        p.repro_threshold = v;
+    }
+    if let Some(v) = f32v("ECO_ENERGY_MAX") {
+        p.energy_max = v;
+    }
+    if let Some(v) = f32v("ECO_INIT_ENERGY") {
+        p.herb_init_energy = v;
+    }
+    if let Some(v) = f32v("ECO_CORPSE") {
+        p.corpse_nutrient = v;
+    }
+    if let Some(v) = usizev("ECO_INIT_HERB") {
+        p.init_herbivores = v;
+    }
+    if std::env::var("ECO_RESEED").is_ok() {
+        p.reseed_on_extinction = true;
+    }
 }
 
 /// Y coordinate an agent must exceed at generation end to survive and

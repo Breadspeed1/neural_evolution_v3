@@ -42,16 +42,71 @@
 //! stochastic step — seeding — draws from a `ChaCha8Rng` seeded deterministically
 //! from `(seed, tick, cell-index)`, so two same-seed runs are bit-identical.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
+use hecs::Entity;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::Serialize;
 
+use crate::Position;
+use crate::agent::{Brain, mutate_genome};
 use crate::grid::{Cell, Grid};
+
+/// Herbivore sensor layout — the forager sensorium fed to the reused
+/// feed-forward [`Brain`] each tick. Width is [`HERB_INPUTS`]; the genome decodes
+/// source ids *modulo* this width, so a different count from the challenge
+/// agent's 17 is fine. Outputs reuse the movement scheme (trigger + 4 dirs).
+///
+/// |  id | sensor      | meaning                                                       |
+/// |----:|-------------|---------------------------------------------------------------|
+/// |   0 | bias        | constant 1.0                                                  |
+/// |   1 | oscillator  | tick parity (0.0 / 1.0)                                       |
+/// |   2 | energy      | own energy / `energy_max`, clamped 0..1 (satiation state)    |
+/// |   3 | random      | fresh per-tick uniform 0..1 (exploration noise)              |
+/// |   4 | food_here   | biomass at the current cell / `biomass_max`                  |
+/// |   5 | grad_ns     | (biomass[y+1] − biomass[y−1]) / `biomass_max`, clamp −1..1   |
+/// |   6 | grad_ew     | (biomass[x+1] − biomass[x−1]) / `biomass_max`, clamp −1..1   |
+/// |   7 | blocked_n   | 1.0 if the +y neighbor is off-grid or occupied              |
+/// |   8 | blocked_s   | 1.0 if the −y neighbor is off-grid or occupied              |
+/// |   9 | blocked_e   | 1.0 if the +x neighbor is off-grid or occupied              |
+/// |  10 | blocked_w   | 1.0 if the −x neighbor is off-grid or occupied              |
+/// |  11 | density     | occupied fraction of the 8-neighborhood (herbivore crowding) |
+const HERB_INPUTS: usize = 12;
+
+/// A herbivore: the first mobile trophic level and the project's first
+/// generation-less birth/death evolver. Bundled as one hecs component (mirroring
+/// the challenge sim's [`crate::agent::Agent`]) alongside a standalone
+/// [`Position`]; energy and lineage ride here because the serial entity phase
+/// touches them together with the brain, so splitting them buys no parallelism.
+pub(crate) struct Herbivore {
+    /// The connection-list genome; a mutated copy is passed to each child.
+    genome: Vec<u32>,
+    /// The decoded feed-forward brain (12 inputs → movement), rebuilt from the
+    /// genome at construction so brain and genome always agree.
+    brain: Brain,
+    /// Body energy. Grazing adds, metabolism/movement subtract; ≤0 ⇒ death,
+    /// ≥ `repro_threshold` ⇒ a mutated child (energy split in half).
+    energy: f32,
+    /// Dynasty id (founder index, inherited verbatim) — viewer coloring only.
+    lineage: u32,
+    /// Inner-neuron count the brain was built with (to build children the same).
+    amt_inners: u8,
+}
+
+/// A read-only per-herbivore snapshot for the viewer, materialized in stable
+/// `order` sequence (keeps the render code off the ECS internals, like the
+/// challenge sim's `AgentView`).
+pub struct HerbView {
+    pub pos: (u32, u32),
+    pub lineage: u32,
+    /// Energy as a 0..1 fraction of `energy_max` (drives brightness).
+    pub energy_frac: f32,
+}
 
 /// The tunable dynamics of the meadow. Kept as a struct (rather than bare
 /// consts) so tests can isolate a single process — e.g. zero the reaction terms
@@ -103,6 +158,39 @@ pub struct EcoParams {
     /// Per-tick seeding probability contributed by each mature neighbor.
     pub seed_rate: f32,
 
+    // --- herbivores (rung 2: the first mobile trophic level) ---
+    /// Max biomass a herbivore can graze from its cell in one tick (the intake
+    /// ceiling — the main lever on how fast herbivores drain the meadow).
+    pub graze_cap: f32,
+    /// Energy gained per unit biomass grazed (trophic transfer efficiency).
+    pub graze_efficiency: f32,
+    /// Baseline energy spent per tick just staying alive (the starvation clock).
+    pub metabolism: f32,
+    /// Extra energy spent on a tick where the herbivore actually changes cell.
+    pub move_cost: f32,
+    /// Energy at/above which a herbivore spawns a mutated child (splitting its
+    /// energy in half) onto an empty neighbor — the reproduction gate.
+    pub repro_threshold: f32,
+    /// Satiation cap: energy never exceeds this, and grazing is throttled to the
+    /// headroom below it (a full animal stops eating), which bounds overgrazing.
+    pub energy_max: f32,
+    /// Energy each founder / reseeded herbivore starts with.
+    pub herb_init_energy: f32,
+    /// Nutrient deposited into a herbivore's cell when it dies (body → soil):
+    /// this is what closes the trophic loop herbivore → nutrient → plant.
+    pub corpse_nutrient: f32,
+    /// Inner-neuron count of each herbivore brain.
+    pub herb_inner_neurons: u8,
+    /// Gene (connection) count of each founder herbivore genome.
+    pub herb_genome_length: usize,
+    /// Per-bit mutation probability applied to a child's inherited genome.
+    pub herb_mutation_rate: f32,
+    /// Number of founder herbivores scattered at initialization.
+    pub init_herbivores: usize,
+    /// If true, scatter a fresh founder cohort whenever the herbivores go extinct
+    /// (a tuning-robustness aid; the coexistence gate is measured with it OFF).
+    pub reseed_on_extinction: bool,
+
     // --- metrics / init ---
     /// Biomass above which a cell counts as "vegetated" for the coverage metric.
     pub coverage_threshold: f32,
@@ -131,6 +219,27 @@ impl Default for EcoParams {
             seed_nutrient_min: 0.42,
             mature: 0.30,
             seed_rate: 0.05,
+            // Herbivore economy tuned (seeds 42/7/123, 128², 40k ticks) for a
+            // robust, self-sustaining plant↔herbivore coexistence: an opening
+            // predator-prey cycle (plant bloom → grazer boom → plant crash) that
+            // relaxes to a persistent steady state (coverage ~12%, ~1600–2000
+            // grazers, mean energy ~3.3). Large energy reserves relative to
+            // metabolism keep grazers off the starvation edge, which is what
+            // makes coexistence robust across seeds. See DESIGN.md for the curve
+            // and the balance logic (why it coexists rather than crashing/exploding).
+            graze_cap: 0.28,
+            graze_efficiency: 1.0,
+            metabolism: 0.02,
+            move_cost: 0.015,
+            repro_threshold: 7.0,
+            energy_max: 10.0,
+            herb_init_energy: 5.0,
+            corpse_nutrient: 0.5,
+            herb_inner_neurons: 12,
+            herb_genome_length: 48,
+            herb_mutation_rate: 0.02,
+            init_herbivores: 150,
+            reseed_on_extinction: false,
             coverage_threshold: 0.10,
             init_density: 0.01,
             init_biomass: 0.50,
@@ -159,6 +268,14 @@ pub struct EcoMetrics {
     pub coverage: f64,
     /// Mean nutrient over all soil cells.
     pub mean_nutrient: f64,
+    /// Live herbivore count — the prey axis of the predator-prey readout.
+    pub population: u64,
+    /// Herbivore births since the previous recorded tick.
+    pub births: u64,
+    /// Herbivore deaths since the previous recorded tick.
+    pub deaths: u64,
+    /// Mean herbivore energy (0.0 when the population is empty).
+    pub mean_energy: f64,
 }
 
 /// Derive a deterministic per-cell seed for the stochastic seeding draw, in the
@@ -173,6 +290,21 @@ fn cell_seed(master: u64, tick: u64, index: usize) -> u64 {
 /// Init tag mixed into the master seed for the founder scatter, kept distinct
 /// from any real tick used by `cell_seed` so the two RNG streams never alias.
 const INIT_TAG: u64 = 0xEC05_EED0_0000_0001;
+
+/// Domain tag mixed into every herbivore RNG stream so a herbivore at index `k`
+/// on tick `t` never draws the same numbers as the *plant* cell at index `k`
+/// (whose stream is `cell_seed`) — the two subsystems stay decorrelated.
+const HERB_TAG: u64 = 0x4845_5242_1000_0001;
+
+/// Per-herbivore RNG seed for the serial entity phase: the analogue of the
+/// generational sim's `agent_seed`, keyed by `(seed, tick, order-index)`. Index
+/// is the herbivore's position in the stable `order` at the tick's start, so the
+/// stream is reproducible regardless of how many draws each brain makes.
+fn herbivore_seed(master: u64, tick: u64, index: usize) -> u64 {
+    let s = crate::mix(master ^ HERB_TAG);
+    let s = crate::mix(s ^ tick);
+    crate::mix(s ^ index as u64)
+}
 
 /// The nutrient field after one diffusion step: an in-bounds, non-obstacle
 /// 4-neighbor stencil with **no-flux boundaries** (walls/edges are simply not
@@ -243,11 +375,21 @@ fn mature_neighbors(cells: &[Cell], width: usize, height: usize, i: usize, matur
     count
 }
 
-/// The continuous producer-base simulation over a shared cell [`Grid`].
+/// The continuous producer-base simulation over a shared cell [`Grid`], now with
+/// a mobile herbivore layer (rung 2) living as hecs entities.
 pub struct EcoSim {
     grid: Grid,
     /// Double-buffer scratch: next tick's `(nutrient, biomass)` per cell.
     next: Vec<(f32, f32)>,
+    /// Herbivores live here as entities: a [`Position`] component + a
+    /// [`Herbivore`] bundle. hecs archetype iteration is not stable across
+    /// despawns, so every determinism-sensitive pass goes through `order`.
+    ecs: hecs::World,
+    /// The stable birth-order of live herbivores — the determinism backbone,
+    /// mirroring the challenge sim. Position in `order` is the per-entity RNG
+    /// index: pushed on birth, `retain`-culled on death (survivors keep their
+    /// relative order), so an entity's index only ever decreases.
+    order: Vec<Entity>,
     tick: u64,
     config: EcoConfig,
     metrics_out: Option<File>,
@@ -256,6 +398,10 @@ pub struct EcoSim {
     /// Record metrics (history + JSONL) every this-many ticks. 1 for the
     /// determinism/headless runs; the viewer bumps it to bound memory.
     metrics_interval: u64,
+    /// Births / deaths accumulated since the last recorded metrics tick (so the
+    /// counts are correct even when `metrics_interval > 1`).
+    births_accum: u64,
+    deaths_accum: u64,
 }
 
 impl EcoSim {
@@ -264,11 +410,15 @@ impl EcoSim {
         EcoSim {
             grid: Grid::new(config.width, config.height),
             next: vec![(0.0, 0.0); n],
+            ecs: hecs::World::new(),
+            order: Vec::new(),
             tick: 0,
             config,
             metrics_out: None,
             history: Vec::new(),
             metrics_interval: 1,
+            births_accum: 0,
+            deaths_accum: 0,
         }
     }
 
@@ -303,7 +453,278 @@ impl EcoSim {
             cell.nutrient = cap;
             cell.biomass = if rng.random::<f32>() < density { founder } else { 0.0 };
         }
+        self.seed_herbivores();
         self.record_metrics();
+    }
+
+    /// Scatter the founder herbivore cohort onto random empty cells, each with a
+    /// fresh random genome (like the challenge sim's founders) and a founder
+    /// lineage id. Uses a dedicated `herbivore_seed`-derived stream so it never
+    /// aliases the plant founder scatter. A no-op when `init_herbivores == 0`
+    /// (the pure producer-base regression tests rely on that).
+    fn seed_herbivores(&mut self) {
+        let p = self.config.params.clone();
+        if p.init_herbivores == 0 {
+            return;
+        }
+        let (w, h) = (self.grid.width as u32, self.grid.height as u32);
+        let mut rng = ChaCha8Rng::seed_from_u64(herbivore_seed(self.config.seed, INIT_TAG, 0));
+        let mut placed = 0usize;
+        // Bounded attempts so a near-full grid can't spin forever.
+        let mut attempts = 0usize;
+        let max_attempts = p.init_herbivores.saturating_mul(200).max(10_000);
+        while placed < p.init_herbivores && attempts < max_attempts {
+            attempts += 1;
+            let pos = (rng.random_range(0..w), rng.random_range(0..h));
+            if self.grid.blocked(pos) {
+                continue;
+            }
+            let genome: Vec<u32> =
+                (0..p.herb_genome_length).map(|_| rng.random::<u32>()).collect();
+            let e = self.spawn_herbivore(
+                pos,
+                genome,
+                p.herb_init_energy,
+                placed as u32,
+                p.herb_inner_neurons,
+            );
+            self.order.push(e);
+            placed += 1;
+        }
+    }
+
+    /// Build a herbivore entity at `pos` (decoding its brain from the genome),
+    /// mark the cell occupied, and return the new entity. Does **not** append to
+    /// `order` — callers control ordering (founders push directly; births are
+    /// appended after the entity phase so they act next tick).
+    fn spawn_herbivore(
+        &mut self,
+        pos: (u32, u32),
+        genome: Vec<u32>,
+        energy: f32,
+        lineage: u32,
+        amt_inners: u8,
+    ) -> Entity {
+        let brain = Brain::from(genome.clone(), HERB_INPUTS, amt_inners);
+        let e = self.ecs.spawn((
+            Position { x: pos.0, y: pos.1 },
+            Herbivore { genome, brain, energy, lineage, amt_inners },
+        ));
+        self.grid.set_occupant(pos, e);
+        e
+    }
+
+    /// Read a herbivore's grid position (copied out, so no ECS borrow escapes).
+    #[inline]
+    fn herb_pos(&self, e: Entity) -> (u32, u32) {
+        let p = self.ecs.get::<&Position>(e).expect("herbivore has Position");
+        (p.x, p.y)
+    }
+
+    /// Read a herbivore's current energy.
+    #[inline]
+    fn herb_energy(&self, e: Entity) -> f32 {
+        self.ecs.get::<&Herbivore>(e).expect("herbivore has Herbivore").energy
+    }
+
+    /// Build the herbivore's sensor input vector at `pos` (see [`HERB_INPUTS`]
+    /// for the layout). Pure gather over the grid snapshot; `rand01` is the
+    /// pre-drawn random-input value from the entity's per-tick RNG.
+    fn sense(&self, pos: (u32, u32), energy: f32, rand01: f32) -> Vec<f32> {
+        let (w, h) = (self.grid.width as i32, self.grid.height as i32);
+        let bm = self.config.params.biomass_max.max(1e-6);
+        let emax = self.config.params.energy_max.max(1e-6);
+        let cells = &self.grid.cells;
+        // Biomass at a cell, treating off-grid as barren.
+        let biomass_at = |x: i32, y: i32| -> f32 {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                0.0
+            } else {
+                cells[y as usize * w as usize + x as usize].biomass
+            }
+        };
+        // "Blocked" for a neighbor: off-grid edges count as blocked, as does an
+        // obstacle or another creature standing there.
+        let blocked_at = |x: i32, y: i32| -> bool {
+            if x < 0 || y < 0 || x >= w || y >= h {
+                true
+            } else {
+                cells[y as usize * w as usize + x as usize].blocked()
+            }
+        };
+        let (x, y) = (pos.0 as i32, pos.1 as i32);
+        let grad_ns = ((biomass_at(x, y + 1) - biomass_at(x, y - 1)) / bm).clamp(-1.0, 1.0);
+        let grad_ew = ((biomass_at(x + 1, y) - biomass_at(x - 1, y)) / bm).clamp(-1.0, 1.0);
+        let mut occ = 0.0f32;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if blocked_at(x + dx, y + dy) {
+                    occ += 1.0;
+                }
+            }
+        }
+        let b = |cond: bool| if cond { 1.0 } else { 0.0 };
+        vec![
+            1.0,
+            (self.tick % 2) as f32,
+            (energy / emax).clamp(0.0, 1.0),
+            rand01,
+            (biomass_at(x, y) / bm).clamp(0.0, 1.0),
+            grad_ns,
+            grad_ew,
+            b(blocked_at(x, y + 1)),
+            b(blocked_at(x, y - 1)),
+            b(blocked_at(x + 1, y)),
+            b(blocked_at(x - 1, y)),
+            occ / 8.0,
+        ]
+    }
+
+    /// Pick a random empty (unblocked, on-grid) cell from the 8-neighborhood of
+    /// `pos`, drawing from `rng` (deterministic). `None` if the herbivore is
+    /// boxed in — reproduction is then skipped this tick.
+    fn empty_neighbor(&self, pos: (u32, u32), rng: &mut ChaCha8Rng) -> Option<(u32, u32)> {
+        let (w, h) = (self.grid.width as i32, self.grid.height as i32);
+        let (x, y) = (pos.0 as i32, pos.1 as i32);
+        let mut opts: Vec<(u32, u32)> = Vec::with_capacity(8);
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                    continue;
+                }
+                if !self.grid.cells[ny as usize * w as usize + nx as usize].blocked() {
+                    opts.push((nx as u32, ny as u32));
+                }
+            }
+        }
+        if opts.is_empty() {
+            None
+        } else {
+            Some(opts[rng.random_range(0..opts.len())])
+        }
+    }
+
+    /// The serial, order-stable entity phase (rung 2). For each live herbivore in
+    /// birth order: sense → brain → move (costs energy, blocked by the grid) →
+    /// graze the current cell (biomass → energy, up to `graze_cap` and the
+    /// satiation headroom) → pay metabolism → then die (deposit a corpse nutrient
+    /// pulse) or reproduce (spawn a mutated child on an empty neighbor, splitting
+    /// energy). Runs *after* the parallel field update, single-threaded, so it
+    /// never races the CA and every RNG draw is reproducible.
+    fn herbivore_phase(&mut self) {
+        let p = self.config.params.clone();
+        let (seed, tick) = (self.config.seed, self.tick);
+        let w = self.grid.width;
+        let (max_x, max_y) = (self.grid.max_x(), self.grid.max_y());
+
+        // Iterate a fixed prefix: children appended this tick (index ≥ n) act
+        // next tick, and `order` is not mutated until after the loop, so
+        // `self.order[idx]` and the RNG index `idx` are stable throughout.
+        let n = self.order.len();
+        let mut dead: Vec<Entity> = Vec::new();
+        let mut births: Vec<Entity> = Vec::new();
+
+        for idx in 0..n {
+            let e = self.order[idx];
+            let pos = self.herb_pos(e);
+            let mut rng = ChaCha8Rng::seed_from_u64(herbivore_seed(seed, tick, idx));
+            let rand01 = rng.random::<f32>();
+            let inputs = self.sense(pos, self.herb_energy(e), rand01);
+            // Brain step in a scoped mutable borrow (dropped before any spawn).
+            let translation = {
+                let mut hb = self.ecs.get::<&mut Herbivore>(e).expect("herbivore exists");
+                hb.brain.step(inputs, &mut rng)
+            };
+
+            // --- movement: only onto an empty, in-bounds cell; costs energy ---
+            let target = (
+                (pos.0 as i32 + translation.0).clamp(0, max_x) as u32,
+                (pos.1 as i32 + translation.1).clamp(0, max_y) as u32,
+            );
+            let mut energy = self.herb_energy(e);
+            let mut cur = pos;
+            if target != pos && !self.grid.blocked(target) {
+                self.grid.clear_occupant(pos);
+                self.grid.set_occupant(target, e);
+                let mut pc = self.ecs.get::<&mut Position>(e).expect("herbivore has Position");
+                pc.x = target.0;
+                pc.y = target.1;
+                cur = target;
+                energy -= p.move_cost;
+            }
+
+            // --- graze the current cell (throttled to satiation headroom) ---
+            let ci = cur.1 as usize * w + cur.0 as usize;
+            let avail = self.grid.cells[ci].biomass;
+            let headroom = (p.energy_max - energy).max(0.0);
+            let by_headroom = if p.graze_efficiency > 1e-6 {
+                headroom / p.graze_efficiency
+            } else {
+                0.0
+            };
+            let grazed = avail.min(p.graze_cap).min(by_headroom);
+            if grazed > 0.0 {
+                self.grid.cells[ci].biomass = avail - grazed;
+                energy += grazed * p.graze_efficiency;
+            }
+
+            // --- metabolism (the starvation clock) ---
+            energy -= p.metabolism;
+
+            // --- death: despawn + return the body to the soil (closes the loop) ---
+            if energy <= 0.0 {
+                self.grid.clear_occupant(cur);
+                self.grid.cells[ci].nutrient += p.corpse_nutrient + energy.max(0.0);
+                dead.push(e);
+                continue;
+            }
+
+            // --- reproduction: split energy onto a mutated child, if room ---
+            if energy >= p.repro_threshold
+                && let Some(child_cell) = self.empty_neighbor(cur, &mut rng)
+            {
+                let child_energy = energy * 0.5;
+                energy -= child_energy;
+                let (pgenome, lineage, amt) = {
+                    let hb = self.ecs.get::<&Herbivore>(e).expect("parent exists");
+                    (hb.genome.clone(), hb.lineage, hb.amt_inners)
+                };
+                let child_genome = mutate_genome(&pgenome, p.herb_mutation_rate, &mut rng);
+                let child = self.spawn_herbivore(child_cell, child_genome, child_energy, lineage, amt);
+                births.push(child);
+            }
+
+            // Commit the (surviving) parent's energy, clamped to the satiation cap.
+            let mut hb = self.ecs.get::<&mut Herbivore>(e).expect("herbivore exists");
+            hb.energy = energy.min(p.energy_max);
+        }
+
+        // Apply deaths (despawn + drop from `order`, preserving survivor order).
+        if !dead.is_empty() {
+            for &e in &dead {
+                let _ = self.ecs.despawn(e);
+            }
+            let dset: HashSet<Entity> = dead.iter().copied().collect();
+            self.order.retain(|e| !dset.contains(e));
+        }
+        // Append this tick's newborns in birth (parent-processing) order.
+        self.order.extend(&births);
+
+        self.births_accum += births.len() as u64;
+        self.deaths_accum += dead.len() as u64;
+
+        // Optional robustness aid (off for the coexistence gate): if the
+        // herbivores died out, scatter a fresh founder cohort.
+        if self.order.is_empty() && p.reseed_on_extinction {
+            self.seed_herbivores();
+        }
     }
 
     /// Advance the meadow one tick: diffuse nutrient, then react (replenish,
@@ -389,6 +810,11 @@ impl EcoSim {
             cell.biomass = b;
         }
 
+        // Phase 3: the serial, order-stable herbivore entity phase. Runs on the
+        // freshly-grown meadow, mutating biomass (grazing), nutrient (corpses),
+        // and occupancy — never concurrently with the parallel CA above.
+        self.herbivore_phase();
+
         self.tick += 1;
         if self.tick.is_multiple_of(self.metrics_interval) {
             self.record_metrics();
@@ -415,12 +841,27 @@ impl EcoSim {
             }
         }
         let denom = soil.max(1) as f64;
+
+        // Herbivore aggregates, summed serially over `order` so the f64 total is
+        // order-deterministic (byte-identical across same-seed runs).
+        let population = self.order.len() as u64;
+        let total_energy: f64 = self.order.iter().map(|&e| self.herb_energy(e) as f64).sum();
+        let mean_energy = if population > 0 { total_energy / population as f64 } else { 0.0 };
+
         let m = EcoMetrics {
             tick: self.tick,
             total_biomass,
             coverage: vegetated as f64 / denom,
             mean_nutrient: total_nutrient / denom,
+            population,
+            births: self.births_accum,
+            deaths: self.deaths_accum,
+            mean_energy,
         };
+        // Births/deaths are reported per recording interval, so reset the running
+        // counters once folded into a record.
+        self.births_accum = 0;
+        self.deaths_accum = 0;
         if let Some(file) = self.metrics_out.as_mut()
             && let Ok(line) = serde_json::to_string(&m)
         {
@@ -456,6 +897,26 @@ impl EcoSim {
         &self.grid.cells
     }
 
+    /// Live herbivore count (the prey axis of the predator-prey readout).
+    pub fn population(&self) -> usize {
+        self.order.len()
+    }
+
+    /// A render snapshot (position + lineage + energy fraction) per herbivore, in
+    /// stable `order` sequence — the viewer draws creatures from this without
+    /// touching the ECS.
+    pub fn herbivore_views(&self) -> Vec<HerbView> {
+        let emax = self.config.params.energy_max.max(1e-6);
+        self.order
+            .iter()
+            .map(|&e| {
+                let pos = self.herb_pos(e);
+                let hb = self.ecs.get::<&Herbivore>(e).expect("herbivore exists");
+                HerbView { pos, lineage: hb.lineage, energy_frac: (hb.energy / emax).clamp(0.0, 1.0) }
+            })
+            .collect()
+    }
+
     /// Every recorded tick's metrics (drives the viewer's biomass/coverage
     /// sparklines and the headless coverage summary).
     pub fn metrics_history(&self) -> &[EcoMetrics] {
@@ -479,6 +940,22 @@ impl EcoSim {
         let c = &self.grid.cells[y * self.grid.width + x];
         (c.nutrient, c.biomass)
     }
+
+    /// Spawn one herbivore at `(x, y)` with an explicit genome + energy and
+    /// append it to `order` (so the entity phase processes it). Test-only escape
+    /// hatch for the rung-2 unit tests, mirroring `set_cell`.
+    #[cfg(test)]
+    fn test_spawn_herbivore(&mut self, x: u32, y: u32, genome: Vec<u32>, energy: f32) -> Entity {
+        let amt = self.config.params.herb_inner_neurons;
+        let e = self.spawn_herbivore((x, y), genome, energy, 0, amt);
+        self.order.push(e);
+        e
+    }
+
+    #[cfg(test)]
+    fn is_live(&self, e: Entity) -> bool {
+        self.ecs.contains(e)
+    }
 }
 
 #[cfg(test)]
@@ -487,6 +964,18 @@ mod tests {
 
     fn cfg(seed: u64, w: usize, h: usize) -> EcoConfig {
         EcoConfig { width: w, height: h, seed, params: EcoParams::default() }
+    }
+
+    /// Freeze the plant/nutrient CA (zero every reaction + diffusion term) so a
+    /// herbivore test can isolate grazing/energy/death from field dynamics.
+    fn freeze_plants(p: &mut EcoParams) {
+        p.diffusion = 0.0;
+        p.replenish = 0.0;
+        p.uptake = 0.0;
+        p.decay = 0.0;
+        p.mortality = 0.0;
+        p.seed_rate = 0.0;
+        p.init_herbivores = 0; // only manually-placed herbivores in these tests
     }
 
     #[test]
@@ -615,7 +1104,11 @@ mod tests {
         // modest grid a few thousand ticks and assert the late-time coverage is
         // in (0.10, 0.85) and biomass is non-trivial. (The headless runner
         // reports the precise curve; this is the always-on regression guard.)
-        let mut sim = EcoSim::new(cfg(42, 96, 96));
+        // Pure producer base (herbivores off), so this stays a regression guard
+        // on rung 1's self-regulation independent of the grazing layer.
+        let mut c = cfg(42, 96, 96);
+        c.params.init_herbivores = 0;
+        let mut sim = EcoSim::new(c);
         sim.seed_initial();
         for _ in 0..3000 {
             sim.tick();
@@ -624,5 +1117,152 @@ mod tests {
         assert!(cov > 0.10, "meadow collapsed (coverage {cov})");
         assert!(cov < 0.85, "meadow filled (coverage {cov})");
         assert!(sim.latest().unwrap().total_biomass > 0.0, "no standing biomass");
+    }
+
+    // ----- rung 2: herbivore grazing / energy / death / reproduction -----
+
+    #[test]
+    fn grazing_converts_biomass_to_energy_and_depletes_the_cell() {
+        // A non-moving herbivore (empty genome ⇒ no outputs fire) on a vegetated
+        // cell grazes up to `graze_cap`, gaining that much energy (efficiency 1)
+        // and removing exactly that much biomass; metabolism is the only other
+        // term. Plants frozen so the cell's biomass change is grazing alone.
+        let mut c = cfg(1, 8, 8);
+        freeze_plants(&mut c.params);
+        c.params.graze_cap = 0.10;
+        c.params.graze_efficiency = 1.0;
+        c.params.metabolism = 0.02;
+        c.params.move_cost = 0.0;
+        c.params.repro_threshold = 100.0; // out of reach ⇒ no reproduction
+        c.params.energy_max = 100.0; // ample headroom ⇒ graze isn't throttled
+        let mut sim = EcoSim::new(c);
+        sim.set_cell(4, 4, 0.5, 0.30);
+        let e = sim.test_spawn_herbivore(4, 4, vec![], 1.0);
+        sim.tick();
+        let (_, b1) = sim.cell_at(4, 4);
+        assert!((b1 - 0.20).abs() < 1e-4, "grazing should remove 0.10 biomass: -> {b1}");
+        let en = sim.herb_energy(e);
+        assert!((en - 1.08).abs() < 1e-4, "energy = 1.0 + 0.10 grazed - 0.02 metabolism: {en}");
+    }
+
+    #[test]
+    fn starvation_kills_at_zero_energy_and_deposits_a_corpse() {
+        // With no food, metabolism drives energy ≤ 0; the herbivore despawns and
+        // its body energy (here just `corpse_nutrient`) is added to the cell's
+        // nutrient — closing the loop back to the soil.
+        let mut c = cfg(2, 8, 8);
+        freeze_plants(&mut c.params);
+        c.params.metabolism = 0.05;
+        c.params.move_cost = 0.0;
+        c.params.corpse_nutrient = 0.40;
+        let mut sim = EcoSim::new(c);
+        sim.set_cell(3, 3, 0.0, 0.0);
+        let e = sim.test_spawn_herbivore(3, 3, vec![], 0.03);
+        assert_eq!(sim.population(), 1);
+        sim.tick();
+        assert_eq!(sim.population(), 0, "starved herbivore should die");
+        assert!(!sim.is_live(e), "dead herbivore must be despawned");
+        let (n, _) = sim.cell_at(3, 3);
+        assert!((n - 0.40).abs() < 1e-4, "death should deposit corpse_nutrient: {n}");
+    }
+
+    /// Config for the reproduction tests: frozen plants, energy conserved
+    /// (metabolism/move free), a low reproduction threshold, deterministic
+    /// (mutation-free) children.
+    fn repro_cfg(seed: u64) -> EcoConfig {
+        let mut c = cfg(seed, 12, 12);
+        freeze_plants(&mut c.params);
+        c.params.metabolism = 0.0;
+        c.params.move_cost = 0.0;
+        c.params.repro_threshold = 1.0;
+        c.params.energy_max = 3.0;
+        c.params.herb_mutation_rate = 0.0;
+        c
+    }
+
+    #[test]
+    fn reproduction_splits_energy_onto_an_empty_neighbor() {
+        // Above threshold with a free neighbor ⇒ one child, energy split in half.
+        let mut sim = EcoSim::new(repro_cfg(3));
+        let parent = sim.test_spawn_herbivore(6, 6, vec![], 1.5);
+        sim.tick();
+        assert_eq!(sim.population(), 2, "should spawn one child");
+        let ep = sim.herb_energy(parent);
+        assert!((ep - 0.75).abs() < 1e-4, "parent keeps half its energy: {ep}");
+        let child = sim.order[1];
+        let ec = sim.herb_energy(child);
+        assert!((ec - 0.75).abs() < 1e-4, "child gets the other half: {ec}");
+    }
+
+    #[test]
+    fn reproduction_needs_an_empty_neighbor() {
+        // Boxed in by obstacles on all 8 neighbors ⇒ no room, so no child even
+        // though energy is above threshold.
+        let mut sim = EcoSim::new(repro_cfg(4));
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                sim.grid.set_obstacle(((6 + dx) as u32, (6 + dy) as u32));
+            }
+        }
+        sim.test_spawn_herbivore(6, 6, vec![], 1.5);
+        sim.tick();
+        assert_eq!(sim.population(), 1, "a boxed-in herbivore cannot reproduce");
+    }
+
+    #[test]
+    fn order_is_stable_across_a_birth_and_a_death_tick() {
+        // In one tick: A reproduces, B starves, C survives. `order` must drop B
+        // (survivors keep their relative slots) and append A's newborn last.
+        let mut c = cfg(5, 16, 16);
+        freeze_plants(&mut c.params);
+        c.params.metabolism = 0.05;
+        c.params.move_cost = 0.0;
+        c.params.repro_threshold = 1.0;
+        c.params.energy_max = 3.0;
+        c.params.herb_mutation_rate = 0.0;
+        let mut sim = EcoSim::new(c);
+        let a = sim.test_spawn_herbivore(2, 2, vec![], 2.0); // reproduces
+        let b = sim.test_spawn_herbivore(9, 9, vec![], 0.03); // starves
+        let cc = sim.test_spawn_herbivore(5, 5, vec![], 0.5); // survives, no repro
+        sim.tick();
+        assert!(!sim.is_live(b), "B should have starved");
+        assert_eq!(sim.population(), 3, "A + C survive, plus A's newborn");
+        assert_eq!(sim.order[0], a, "A keeps its birth slot");
+        assert_eq!(sim.order[1], cc, "C shifts up into B's freed slot, order preserved");
+        assert!(sim.order[2] != a && sim.order[2] != cc, "the newborn is appended last");
+    }
+
+    #[test]
+    fn herbivore_run_is_deterministic() {
+        // The whole rung-2 sim (parallel field CA + serial entity phase) is
+        // byte-identical across two same-seed runs: fields *and* the herbivore
+        // metrics (population, biomass, mean energy).
+        let run = || {
+            let mut sim = EcoSim::new(cfg(2024, 64, 64));
+            sim.seed_initial();
+            for _ in 0..300 {
+                sim.tick();
+            }
+            let fields: Vec<(u32, u32)> = sim
+                .cells()
+                .iter()
+                .map(|c| (c.nutrient.to_bits(), c.biomass.to_bits()))
+                .collect();
+            let metrics: Vec<(u64, u64, u64, u64, u64)> = sim
+                .metrics_history()
+                .iter()
+                .map(|m| {
+                    (m.population, m.births, m.deaths, m.total_biomass.to_bits(), m.mean_energy.to_bits())
+                })
+                .collect();
+            (fields, metrics)
+        };
+        let a = run();
+        let b = run();
+        assert!(a.0 == b.0, "fields diverged under an identical seed");
+        assert!(a.1 == b.1, "herbivore metrics diverged under an identical seed");
     }
 }

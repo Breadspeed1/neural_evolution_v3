@@ -43,6 +43,34 @@ Every step in this roadmap obeys the inversion of that mistake:
   Vec<Entity>` in stable birth order (hecs archetype iteration is *not* stable
   across despawns), and position in `order` is the per-agent RNG index exactly as
   the old `Vec<Agent>` index was.
+- **Ecosystem terrarium — producer base** *(rung 1 of the ecosystem ladder;
+  `--mode eco`)*: a **separate, continuous (generation-less)** sim in
+  `src/eco.rs` that reuses the shared substrate — the cell `Grid`, seeded
+  ChaCha8 determinism, rayon, and the JSONL-metrics/dashboard patterns — without
+  touching the generational `Simulator`; the two coexist behind
+  `--mode {challenge,eco}` (default `challenge`, fully unchanged and
+  byte-identical). Two trophic layers are modeled as **double-buffered
+  cellular-automaton fields** on the grid (no animals / hecs entities yet — plants
+  are per-cell state): a **nutrient** field (soil/decomposers: von-Neumann
+  diffusion with no-flux boundaries + replenishment toward a soil capacity) and a
+  **plant biomass** field (producers: nutrient-fed logistic growth that *consumes
+  local nutrient* — the self-limiter — plus probabilistic seeding into empty
+  neighbors, slow senescence, and a gentle disturbance mortality that returns mass
+  to soil and keeps the mosaic breathing). The update reads an immutable snapshot
+  and writes a fresh buffer, so it is order-independent, rayon-parallel over cells,
+  and reproducible; the one stochastic step (seeding/mortality) draws a ChaCha8
+  seeded from `(seed, tick, cell-index)`. **Signal-first gate met**: from a sparse
+  ~1% seeding (seed 42, 128²) coverage climbs (tick 25 → 4.3%, 50 → 11.0%,
+  100 → 29.8%), overshoots to a ~56% pioneer bloom at tick 200, then **relaxes to
+  a stable, patchy, gently-fluctuating plateau of ~32% coverage** (tick 500 →
+  43.5%, 1000 → 32.4%, 5000 → 32.6%, 10000 → 32.4%; mean nutrient ~0.31) — neither
+  filling to 100% nor collapsing to 0%, and seed-independent (seed 123 → 32.5%).
+  Same-seed
+  runs are **byte-identical** (verified by diffing two headless metrics files).
+  Headless `--mode eco --ticks N` prints the coverage-over-time curve; the viewer
+  renders a layered diorama (subtle soil wash ∝ nutrient, green ∝ √biomass) with
+  biomass + coverage sparklines on the shared dark shell. This producer base is
+  what rung 2's herbivores (hecs entities with energy) will graze.
 - **Core sim**: parallel (rayon) step, seeded ChaCha8 determinism (reproducible
   across the parallel decision phase), geometric-skip mutation.
 - **Harness**: lib + headless/viewer bins, clap CLI, per-generation JSONL

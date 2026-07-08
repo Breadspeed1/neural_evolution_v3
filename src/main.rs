@@ -1,10 +1,11 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
+use hecs::Entity;
 use macroquad::prelude::*;
 use neural_evolution::agent::Connection;
-use neural_evolution::eco::EcoSim;
+use neural_evolution::eco::{EcoMetrics, EcoSim, HerbView};
 use neural_evolution::grid::Cell;
 use neural_evolution::{AgentView, Cli, Mode, Simulator, build_eco_sim, build_simulator};
 
@@ -75,11 +76,14 @@ const NUTRIENT_HUE: Color = Color::new(176.0 / 255.0, 138.0 / 255.0, 96.0 / 255.
 // Herbivore accent (a warm amber, distinct from the plant/soil greens & browns)
 // for the population sparkline and the creatures legend swatch.
 const HERB_HUE: Color = Color::new(232.0 / 255.0, 176.0 / 255.0, 64.0 / 255.0, 1.0);
-const HERB_RGB: [u8; 3] = [232, 176, 64];
 
 const MARGIN: f32 = 14.0;
 /// How many recent positions each agent's motion trail retains.
 const TRAIL_LEN: usize = 18;
+/// Trail length for the eco spotlight protagonist — longer than the challenge
+/// crowd trails, since only the one selected grazer carries a trail here, so it
+/// can afford a strong, far-reaching comet tail.
+const ECO_TRAIL_LEN: usize = 44;
 /// In unlimited mode, record a trail sample at most every this-many sim steps,
 /// bounding the per-frame recording cost when thousands of steps run per frame
 /// (visual continuity is a normal-speed concern, not an unlimited-speed one).
@@ -376,6 +380,18 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
     let mut display = true;
     let mut step_accum: f64 = 0.0;
 
+    // --- storytelling state (viewer-side only) ---
+    // Spotlight mode: dim the crowd to a wash, elevate one selected protagonist.
+    let mut spotlight = false;
+    // The tracked protagonist, by stable hecs entity (its `order` index shifts as
+    // neighbours die). Follows the creature across ticks; on its death we
+    // auto-reselect via the `b` heuristic.
+    let mut selected: Option<Entity> = None;
+    // The selected grazer's pruned signal-flow brain, rebuilt only on reselection.
+    let mut graph: Option<BrainGraph> = None;
+    // The protagonist's motion trail (world cells, newest last), sampled per frame.
+    let mut trail: Vec<(u32, u32)> = Vec::new();
+
     // Persistent texture sized to the grid, updated in place each frame.
     let mut frame_image = Image::gen_image_color(gw as u16, gh as u16, WHITE);
     let texture = Texture2D::from_image(&frame_image);
@@ -388,11 +404,24 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
     let mut sps_smooth = 0.0;
 
     // Optional smoke-test screenshot: grab one frame once the meadow has grown in.
+    // `NEURAL_SHOT_TICK` overrides when (default 2000); `NEURAL_SPOTLIGHT` starts
+    // in spotlight mode so the automated grab can capture the protagonist view.
     let screenshot_path = std::env::var("NEURAL_SCREENSHOT").ok();
+    let shot_tick: u64 = std::env::var("NEURAL_SHOT_TICK").ok().and_then(|v| v.parse().ok()).unwrap_or(2000);
+    if std::env::var("NEURAL_SPOTLIGHT").is_ok() {
+        spotlight = true;
+    }
     let mut shot = false;
+    // For a clean screenshot, fast-forward (unrendered) to just shy of the target
+    // tick, so the final stretch renders at normal speed and the trail is smooth.
+    if screenshot_path.is_some() {
+        while eco.tick_count() + 250 < shot_tick {
+            eco.tick();
+        }
+    }
 
     while eco.tick_count() < ticks {
-        // --- input (mirrors the challenge viewer's speed / display controls) ---
+        // --- input (speed / display, plus the eco storytelling controls) ---
         if is_key_pressed(KeyCode::Q) {
             if unlimited {
                 unlimited = false;
@@ -413,6 +442,10 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
         if is_key_pressed(KeyCode::V) {
             display = !display;
             println!("display {}", if display { "on" } else { "off" });
+        }
+        if display && is_key_pressed(KeyCode::F) {
+            spotlight = !spotlight;
+            println!("spotlight {}", if spotlight { "on" } else { "off" });
         }
 
         // --- advance the meadow for this frame ---
@@ -459,13 +492,58 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
         clear_background(BG_PAGE);
         if display {
             let world_px = screen_height();
-            draw_eco_world(eco, world_px, &mut frame_image, &texture);
-            draw_eco_dashboard(eco, world_px, target_sps, unlimited, display, fps_smooth, sps_smooth);
+            // One herbivore snapshot per frame; selection + drawing read from it.
+            let views = eco.herbivore_views();
+            let top_lineage = eco.latest().and_then(|m| m.lineage_counts.first().map(|&(l, _)| l));
+
+            // Resolve the selection: drop it if the protagonist died, then
+            // (re)select the heuristic best so a brain is always on show.
+            if let Some(e) = selected
+                && !views.iter().any(|v| v.entity == e)
+            {
+                selected = None;
+            }
+            if selected.is_none() {
+                set_herb_selection(eco, best_herb(&views, top_lineage), &mut selected, &mut graph, &mut trail);
+            }
+
+            // Click selects the nearest grazer; `b` reselects the heuristic best.
+            if is_mouse_button_pressed(MouseButton::Left) {
+                let (mx, my) = mouse_position();
+                let cell = world_px / eco.width().max(1) as f32;
+                if mx < world_px && my < world_px && cell > 0.0 {
+                    let (cx, cy) = ((mx / cell) as i32, (my / cell) as i32);
+                    if let Some(e) = nearest_herb(&views, cx, cy, 5) {
+                        set_herb_selection(eco, Some(e), &mut selected, &mut graph, &mut trail);
+                    }
+                }
+            }
+            if is_key_pressed(KeyCode::B) {
+                set_herb_selection(eco, best_herb(&views, top_lineage), &mut selected, &mut graph, &mut trail);
+            }
+
+            // Track the protagonist's path (skip consecutive duplicates so a
+            // stationary grazer keeps a short trail, not a stack of one point).
+            let sel_view = selected.and_then(|e| views.iter().find(|v| v.entity == e));
+            if let Some(v) = sel_view {
+                if trail.last() != Some(&v.pos) {
+                    trail.push(v.pos);
+                }
+                if trail.len() > ECO_TRAIL_LEN {
+                    trail.remove(0);
+                }
+            }
+
+            draw_eco_world(eco, &views, spotlight, sel_view, &trail, world_px, &mut frame_image, &texture);
+            draw_eco_dashboard(
+                eco, sel_view, graph.as_ref(), spotlight, world_px, target_sps, unlimited, display,
+                fps_smooth, sps_smooth,
+            );
         }
 
         if let Some(path) = &screenshot_path
             && !shot
-            && eco.tick_count() >= 2000
+            && eco.tick_count() >= shot_tick
         {
             // Grab once the meadow has passed its pioneer bloom and settled into
             // the plant↔herbivore coexistence, so the shot shows the steady state.
@@ -477,10 +555,77 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
     }
 }
 
+/// Assign the eco selection and rebuild the (cached) signal-flow brain for it,
+/// resetting the protagonist's trail. The wiring is copied out of the ECS; the
+/// tighter [`HERB_MAX_EDGES`] cap keeps the herbivore circuit legible.
+fn set_herb_selection(
+    eco: &EcoSim,
+    sel: Option<Entity>,
+    selected: &mut Option<Entity>,
+    graph: &mut Option<BrainGraph>,
+    trail: &mut Vec<(u32, u32)>,
+) {
+    *selected = sel;
+    *graph = sel
+        .and_then(|e| eco.herb_connections(e))
+        .map(|c| BrainGraph::build_capped(&c, HERB_MAX_EDGES));
+    trail.clear();
+}
+
+/// The auto-selected protagonist: the highest-energy member of the current
+/// largest lineage (the reigning dynasty's fittest grazer), falling back to the
+/// globally fattest grazer before the first dynasty record exists. Selecting
+/// within the dominant bloodline ties the spotlight to the bloodlines strip — the
+/// ringed creature's hue matches the strip's widest band — and energy picks a
+/// thriving, long-lived individual, so the spotlight stays populated across ticks.
+fn best_herb(views: &[HerbView], top_lineage: Option<u32>) -> Option<Entity> {
+    let fattest = |pool: &mut dyn Iterator<Item = &HerbView>| {
+        pool.max_by(|a, b| {
+            a.energy_frac.partial_cmp(&b.energy_frac).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|v| v.entity)
+    };
+    if let Some(l) = top_lineage
+        && let Some(e) = fattest(&mut views.iter().filter(|v| v.lineage == l))
+    {
+        return Some(e);
+    }
+    fattest(&mut views.iter())
+}
+
+/// Nearest grazer to cell (cx, cy) within `radius` cells (squared-Euclidean), if
+/// any — the click-to-select pick. Returns the stable entity, not an index.
+fn nearest_herb(views: &[HerbView], cx: i32, cy: i32, radius: i32) -> Option<Entity> {
+    let mut best: Option<(i32, Entity)> = None;
+    for v in views {
+        let (ax, ay) = (v.pos.0 as i32, v.pos.1 as i32);
+        let d2 = (ax - cx).pow(2) + (ay - cy).pow(2);
+        if d2 <= radius * radius && best.is_none_or(|(bd, _)| d2 < bd) {
+            best = Some((d2, v.entity));
+        }
+    }
+    best.map(|(_, e)| e)
+}
+
 /// Composite the meadow into the grid-sized texture (a nutrient wash under plant
-/// green, obstacles solid), blit it into the world square with nearest-neighbour
-/// scaling, then draw the herbivores on top as bright lineage-colored creatures.
-fn draw_eco_world(eco: &EcoSim, world_px: f32, image: &mut Image, texture: &Texture2D) {
+/// green, obstacles solid) and blit it into the world square, then draw the
+/// grazers over it. Two moods: the **calm baseline** (`spotlight` off) draws the
+/// whole crowd as a living texture — size and brightness both rising with energy,
+/// so fat and starving read at a glance; **spotlight** (`spotlight` on) dims the
+/// crowd to a faint wash and elevates the one selected protagonist. In either
+/// mood the selected grazer gets a full-bright body, a bright selection ring, and
+/// a fading comet-tail trail.
+#[allow(clippy::too_many_arguments)]
+fn draw_eco_world(
+    eco: &EcoSim,
+    views: &[HerbView],
+    spotlight: bool,
+    sel_view: Option<&HerbView>,
+    trail: &[(u32, u32)],
+    world_px: f32,
+    image: &mut Image,
+    texture: &Texture2D,
+) {
     let p = eco.params();
     let (soil_cap, biomass_max) = (p.soil_cap.max(1e-6), p.biomass_max.max(1e-6));
     let pixels = image.get_image_data_mut();
@@ -499,19 +644,62 @@ fn draw_eco_world(eco: &EcoSim, world_px: f32, image: &mut Image, texture: &Text
         },
     );
 
-    // Herbivores: a bright dot per creature, hue = lineage (dynasty), brightness
-    // rising with energy so a starving animal reads dim and a fat one pops. A
-    // thin dark ring keeps them legible over the green. Radius floors at ~1.6px
-    // so they never vanish on a big meadow.
     let cell = world_px / eco.width().max(1) as f32;
-    let r = (cell * 0.52).max(1.6);
-    for h in eco.herbivore_views() {
-        let (cx, cy) = ((h.pos.0 as f32 + 0.5) * cell, (h.pos.1 as f32 + 0.5) * cell);
-        let hue = (h.lineage as f32 * 0.618_034).fract();
-        let light = 0.44 + 0.26 * h.energy_frac;
-        let (cr, cg, cb) = hsl_to_rgb(hue, 0.85, light);
-        draw_circle(cx, cy, r + 0.6, Color::new(0.04, 0.05, 0.03, 0.85));
+    let center = |p: (u32, u32)| ((p.0 as f32 + 0.5) * cell, (p.1 as f32 + 0.5) * cell);
+    let sel_entity = sel_view.map(|v| v.entity);
+
+    if spotlight {
+        // Dim the whole crowd to a faint lineage-tinted wash — a quiet field the
+        // protagonist stands against. Small, low-alpha, no ring (also cheaper).
+        let r = (cell * 0.42).max(1.1);
+        for h in views {
+            if Some(h.entity) == sel_entity {
+                continue;
+            }
+            let (cx, cy) = center(h.pos);
+            let (cr, cg, cb) = hsl_to_rgb(lineage_hue(h.lineage), 0.55, 0.42);
+            draw_circle(cx, cy, r, Color::new(cr, cg, cb, 0.16));
+        }
+    } else {
+        // Calm baseline: the crowd as a living texture. Radius *and* brightness
+        // rise with energy (fat vs starving at a glance); a thin dark ring keeps
+        // lineage color legible over the green. Softer/smaller than the old
+        // ~2500-dot "confetti" — desaturated, lower alpha, and starving animals
+        // shrink to specks — so density reads as a breathing meadow, not sprinkles.
+        for h in views {
+            let (cx, cy) = center(h.pos);
+            let r = (cell * (0.24 + 0.32 * h.energy_frac)).max(1.2);
+            let (cr, cg, cb) = hsl_to_rgb(lineage_hue(h.lineage), 0.70, 0.38 + 0.26 * h.energy_frac);
+            draw_circle(cx, cy, r + 0.4, Color::new(0.04, 0.05, 0.03, 0.42));
+            draw_circle(cx, cy, r, Color::new(cr, cg, cb, 0.82));
+        }
+    }
+
+    // The protagonist's comet tail: newer segments brighter and thicker. Reads
+    // strongest against the dimmed spotlight field, but drawn in both moods.
+    if trail.len() >= 2 {
+        let hue = sel_view.map(|v| lineage_hue(v.lineage)).unwrap_or(0.12);
+        let (tr, tg, tb) = hsl_to_rgb(hue, 0.85, 0.62);
+        let n = trail.len();
+        for k in 1..n {
+            let f = k as f32 / n as f32; // 0 (old) .. 1 (new)
+            let (x0, y0) = center(trail[k - 1]);
+            let (x1, y1) = center(trail[k]);
+            draw_line(x0, y0, x1, y1, 1.0 + 2.4 * f, Color::new(tr, tg, tb, 0.12 + 0.66 * f));
+        }
+    }
+
+    // The protagonist itself: full-bright body + a bright selection ring, so the
+    // one selected creature stands out whether or not the crowd is dimmed.
+    if let Some(v) = sel_view {
+        let (cx, cy) = center(v.pos);
+        let r = (cell * 0.62).max(2.2);
+        let (cr, cg, cb) = hsl_to_rgb(lineage_hue(v.lineage), 0.90, 0.42 + 0.26 * v.energy_frac);
+        draw_circle(cx, cy, r + 1.2, Color::new(0.02, 0.03, 0.02, 0.9));
         draw_circle(cx, cy, r, Color::new(cr, cg, cb, 1.0));
+        let ring = (cell * 2.4).max(9.0);
+        draw_circle_lines(cx, cy, ring, 2.0, Color::new(1.0, 1.0, 1.0, 0.95));
+        draw_circle_lines(cx, cy, ring + 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.32));
     }
 }
 
@@ -529,10 +717,15 @@ fn eco_pixel(cell: &Cell, soil_cap: f32, biomass_max: f32) -> [u8; 4] {
     blend_px(px, PLANT_RGB, 0.92 * bt)
 }
 
-/// The eco dashboard column: status, coverage + biomass sparklines, a layers
-/// legend, and the keybind strip. Reuses the shared panel/sparkline helpers.
+/// The eco dashboard column: status, the predator-prey sparklines, the dynasty
+/// **bloodlines strip**, and the selected grazer's **signal-flow brain**, with
+/// the keybind strip pinned to the bottom. Reuses the shared panel helpers.
+#[allow(clippy::too_many_arguments)]
 fn draw_eco_dashboard(
     eco: &EcoSim,
+    sel_view: Option<&HerbView>,
+    graph: Option<&BrainGraph>,
+    spotlight: bool,
     world_px: f32,
     target_sps: f64,
     unlimited: bool,
@@ -551,13 +744,21 @@ fn draw_eco_dashboard(
     let dim = measure_text(&hud, None, 15, 1.0);
     draw_text(&hud, world_px - dim.width - 12.0, 20.0, 15.0, MUTED);
 
-    let status_h = 214.0;
-    draw_eco_status_panel(eco, col_x, y, col_w, status_h, target_sps, unlimited, display);
+    // Keybind strip pinned to the bottom (computed first so the panels above can
+    // fill the remaining height). `f` toggles spotlight, `b` reselects, click
+    // picks the nearest grazer.
+    let legend = "q/e speed  ·  f spotlight  ·  b best  ·  click select  ·  v display";
+    let legend_h = 26.0;
+    let legend_y = screen_height() - MARGIN - legend_h;
+    draw_text(legend, col_x, legend_y + 17.0, 14.0, MUTED);
+
+    let status_h = 196.0;
+    draw_eco_status_panel(eco, col_x, y, col_w, status_h, target_sps, unlimited, display, spotlight);
     y += status_h + MARGIN;
 
-    // Three coupled series so the predator-prey story reads top to bottom: plant
-    // coverage, herbivore population (the prey/predator pair), and total biomass.
-    let spark_h = 116.0;
+    // The predator-prey pulse: plant coverage, herbivore population (the pair),
+    // and total biomass.
+    let spark_h = 90.0;
     let coverage: Vec<f32> = eco.metrics_history().iter().map(|m| m.coverage as f32).collect();
     draw_sparkline(col_x, y, col_w, spark_h, &coverage, Some((0.0, 1.0)), "plant coverage", PLANT_HUE, true, "{:.0}%", 100.0);
     y += spark_h + MARGIN;
@@ -570,15 +771,15 @@ fn draw_eco_dashboard(
     draw_sparkline(col_x, y, col_w, spark_h, &biomass, None, "biomass", NUTRIENT_HUE, false, "{:.0}", 1.0);
     y += spark_h + MARGIN;
 
-    // Keybind strip pinned to the bottom.
-    let legend = "q/e speed  ·  v display";
-    let legend_h = 26.0;
-    let legend_y = screen_height() - MARGIN - legend_h;
-    draw_text(legend, col_x, legend_y + 17.0, 14.0, MUTED);
+    // Bloodlines strip: dynasty population share over time — the "watch evolution
+    // happen" panel (selective sweeps, blooms, crashes).
+    let dynasty_h = 150.0;
+    draw_dynasty_strip(col_x, y, col_w, dynasty_h, eco.metrics_history());
+    y += dynasty_h + MARGIN;
 
-    // Layers legend fills the remaining space above the keybinds.
-    let layers_h = (legend_y - MARGIN - y).max(80.0);
-    draw_eco_layers_panel(col_x, y, col_w, layers_h);
+    // The selected grazer's live signal-flow brain fills the rest of the column.
+    let brain_h = (legend_y - MARGIN - y).max(120.0);
+    draw_eco_brain_panel(eco, col_x, y, col_w, brain_h, sel_view, graph);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -591,6 +792,7 @@ fn draw_eco_status_panel(
     target_sps: f64,
     unlimited: bool,
     display: bool,
+    spotlight: bool,
 ) {
     draw_panel(x, y, w, h);
     let pad = MARGIN;
@@ -620,56 +822,200 @@ fn draw_eco_status_panel(
     row("herbivores", &population.to_string(), TEXT_PRIMARY, &mut ly);
     row("mean energy", &format!("{mean_energy:.2}"), TEXT_SECONDARY, &mut ly);
     row("flux", &format!("+{births} births  ·  -{deaths} deaths"), TEXT_SECONDARY, &mut ly);
-    row("speed", &format!("{speed}   display {}", if display { "on" } else { "off" }), TEXT_SECONDARY, &mut ly);
+    row(
+        "view",
+        &format!("{speed}   display {}   spotlight {}", if display { "on" } else { "off" }, if spotlight { "on" } else { "off" }),
+        TEXT_SECONDARY,
+        &mut ly,
+    );
 }
 
-/// A small caption panel keying the diorama's layers to their colors.
-fn draw_eco_layers_panel(x: f32, y: f32, w: f32, h: f32) {
+/// How many distinct lineages the bloodlines strip tracks as their own colored
+/// band (the top-N by peak population share across the visible history); every
+/// other lineage folds into the muted "other" band. Kept below the record's
+/// [`TOP_LINEAGES`] cap so the bands stay hue-distinct.
+const DYNASTY_BANDS: usize = 10;
+
+/// The bloodlines strip: a stacked-area chart of **lineage population share over
+/// time**, driven by the committed per-interval dynasty record
+/// ([`EcoMetrics::lineage_counts`]). Each colored band is one dynasty, hued by
+/// the same `lineage_hue` mapping its grazers use on the meadow (so a band and
+/// its creatures match), stacked over a muted "other" for the long tail. Watch
+/// dynasties bloom, dominate, and crash — a live selective sweep.
+fn draw_dynasty_strip(x: f32, y: f32, w: f32, h: f32, history: &[EcoMetrics]) {
     draw_panel(x, y, w, h);
     let pad = MARGIN;
-    draw_header("layers", x + pad, y + 22.0);
+    draw_header("bloodlines", x + pad, y + 20.0);
 
-    let swatch = |sy: f32, col: Color, label: &str| {
-        draw_rectangle(x + pad, sy - 10.0, 14.0, 14.0, col);
-        draw_rectangle_lines(x + pad, sy - 10.0, 14.0, 14.0, 1.0, HAIRLINE);
-        draw_text(label, x + pad + 24.0, sy + 2.0, 16.0, TEXT_SECONDARY);
-    };
-    let mut sy = y + 52.0;
-    swatch(sy, rgb_color(HERB_RGB), "herbivores  (grazers, color = lineage)");
-    sy += 26.0;
-    swatch(sy, rgb_color(PLANT_RGB), "plant biomass  (producers)");
-    sy += 26.0;
-    swatch(sy, rgb_color(SOIL_RGB), "soil nutrient  (decomposers)");
-    sy += 34.0;
+    let plot_x = x + pad;
+    let plot_w = (w - 2.0 * pad).max(1.0);
+    let plot_y = y + 30.0;
+    let plot_h = (h - 40.0).max(1.0);
+    let baseline = plot_y + plot_h;
 
-    let note = "herbivores graze the meadow, breed on surplus energy, and starve when it thins; plants and grazers coexist in a self-sustaining cycle, corpses feeding the soil.";
-    for (i, line) in wrap_text(note, w - 2.0 * pad, 14).iter().enumerate() {
-        draw_text(line, x + pad, sy + i as f32 * 17.0, 14.0, MUTED);
+    if history.len() < 2 {
+        draw_line(plot_x, baseline, plot_x + plot_w, baseline, 1.0, BASELINE);
+        draw_text("(gathering lineages…)", plot_x, plot_y + plot_h * 0.5, 15.0, MUTED);
+        return;
     }
-}
 
-/// A macroquad `Color` from an `[r,g,b]` byte triple.
-fn rgb_color(c: [u8; 3]) -> Color {
-    Color::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0)
-}
-
-/// Greedy word-wrap to a pixel width at the given font size (for the caption).
-fn wrap_text(text: &str, max_w: f32, font_size: u16) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        let trial = if cur.is_empty() { word.to_string() } else { format!("{cur} {word}") };
-        if measure_text(&trial, None, font_size, 1.0).width > max_w && !cur.is_empty() {
-            lines.push(cur);
-            cur = word.to_string();
-        } else {
-            cur = trial;
+    // Tracked dynasties: the top-N lineages by peak share across the history.
+    // A lineage that ever rose to prominence keeps its band (so crashes show),
+    // and the set is stable frame to frame, so bands don't flicker.
+    let mut peak: BTreeMap<u32, f32> = BTreeMap::new();
+    for m in history {
+        if m.population == 0 {
+            continue;
+        }
+        let pop = m.population as f32;
+        for &(l, c) in &m.lineage_counts {
+            let s = c as f32 / pop;
+            let e = peak.entry(l).or_insert(0.0);
+            if s > *e {
+                *e = s;
+            }
         }
     }
-    if !cur.is_empty() {
-        lines.push(cur);
+    let mut ranked: Vec<(u32, f32)> = peak.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    ranked.truncate(DYNASTY_BANDS);
+    let mut tracked: Vec<u32> = ranked.into_iter().map(|(l, _)| l).collect();
+    tracked.sort_unstable(); // stable stacking slots, ordered by lineage id
+
+    // Per-record share vector: one entry per tracked lineage, then "other" (the
+    // remainder), so every column sums to exactly 1.0.
+    let bands = tracked.len() + 1;
+    let shares: Vec<Vec<f32>> = history
+        .iter()
+        .map(|m| {
+            let mut row = vec![0.0f32; bands];
+            if m.population > 0 {
+                let pop = m.population as f32;
+                let mut sum = 0.0;
+                for (i, &l) in tracked.iter().enumerate() {
+                    if let Some(&(_, c)) = m.lineage_counts.iter().find(|&&(ll, _)| ll == l) {
+                        let s = c as f32 / pop;
+                        row[i] = s;
+                        sum += s;
+                    }
+                }
+                row[bands - 1] = (1.0 - sum).max(0.0);
+            } else {
+                row[bands - 1] = 1.0;
+            }
+            row
+        })
+        .collect();
+
+    // Downsample records to at most plot-width columns (bucket-mean per band).
+    let cols = (plot_w as usize).clamp(2, shares.len());
+    let col_share = |j: usize| -> Vec<f32> {
+        let a = j * shares.len() / cols;
+        let b = ((j + 1) * shares.len() / cols).max(a + 1).min(shares.len());
+        let mut acc = vec![0.0f32; bands];
+        for r in &shares[a..b] {
+            for (k, v) in r.iter().enumerate() {
+                acc[k] += v;
+            }
+        }
+        let n = (b - a) as f32;
+        for v in &mut acc {
+            *v /= n;
+        }
+        acc
+    };
+    let band_color = |i: usize| -> Color {
+        if i == bands - 1 {
+            Color::new(0.24, 0.24, 0.22, 0.78) // muted "other"
+        } else {
+            let (r, g, b) = hsl_to_rgb(lineage_hue(tracked[i]), 0.62, 0.55);
+            Color::new(r, g, b, 0.92)
+        }
+    };
+
+    // Stacked areas: for each column pair, a filled trapezoid per band. Bands
+    // stack bottom→top in `tracked` (id) order, then "other" on top.
+    let dx = plot_w / (cols - 1) as f32;
+    let mut prev = col_share(0);
+    for j in 1..cols {
+        let cur = col_share(j);
+        let x0 = plot_x + (j - 1) as f32 * dx;
+        let x1 = plot_x + j as f32 * dx;
+        let mut cum0 = 0.0f32;
+        let mut cum1 = 0.0f32;
+        for k in 0..bands {
+            let (s0, s1) = (prev[k], cur[k]);
+            let yb0 = baseline - cum0 * plot_h;
+            let yt0 = baseline - (cum0 + s0) * plot_h;
+            let yb1 = baseline - cum1 * plot_h;
+            let yt1 = baseline - (cum1 + s1) * plot_h;
+            let col = band_color(k);
+            draw_triangle(vec2(x0, yb0), vec2(x0, yt0), vec2(x1, yt1), col);
+            draw_triangle(vec2(x0, yb0), vec2(x1, yt1), vec2(x1, yb1), col);
+            cum0 += s0;
+            cum1 += s1;
+        }
+        prev = cur;
     }
-    lines
+    draw_line(plot_x, baseline, plot_x + plot_w, baseline, 1.0, BASELINE);
+
+    // Right-aligned caption: the current dominant dynasty's share.
+    if let Some(m) = history.last()
+        && m.population > 0
+        && let Some(&(_, c)) = m.lineage_counts.first()
+    {
+        let lbl = format!("top {:.0}%", c as f32 / m.population as f32 * 100.0);
+        let tw = measure_text(&lbl, None, 14, 1.0).width;
+        draw_text(&lbl, plot_x + plot_w - tw - 2.0, y + 20.0, 14.0, MUTED);
+    }
+}
+
+/// The selected grazer's brain panel: header + subtitle, then the shared
+/// signal-flow node-link diagram ([`draw_brain_graph`]) over the forager
+/// sensorium ([`HERB_INPUT_LABELS`]). Live activations are read every frame; the
+/// pruned graph was cached at selection.
+fn draw_eco_brain_panel(
+    eco: &EcoSim,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    sel_view: Option<&HerbView>,
+    graph: Option<&BrainGraph>,
+) {
+    draw_panel(x, y, w, h);
+    let pad = MARGIN;
+    draw_header("brain - grazer", x + pad, y + 22.0);
+
+    let (Some(v), Some(g)) = (sel_view, graph) else {
+        draw_text("(no grazer selected)", x + pad, y + 50.0, 15.0, MUTED);
+        return;
+    };
+
+    let subtitle = if g.active_total > g.edges.len() {
+        format!(
+            "lineage {}  ·  {:.0}% energy  ·  showing {}/{} edges",
+            v.lineage, v.energy_frac * 100.0, g.edges.len(), g.active_total
+        )
+    } else {
+        format!(
+            "lineage {}  ·  {:.0}% energy  ·  {} edges, {} inner",
+            v.lineage, v.energy_frac * 100.0, g.edges.len(), g.inner_ids.len()
+        )
+    };
+    draw_text(&subtitle, x + pad, y + 42.0, 14.0, MUTED);
+
+    let gx = x + pad;
+    let gy = y + 58.0;
+    let gw = w - 2.0 * pad;
+    let gh = h - 66.0;
+    if gh < 40.0 {
+        return;
+    }
+    let Some(neurons) = eco.herb_neurons(v.entity) else {
+        return;
+    };
+    draw_brain_graph(gx, gy, gw, gh, g, &neurons, &HERB_INPUT_LABELS);
 }
 
 /// Append the current agent positions as the newest trail sample, capped to
@@ -928,6 +1274,13 @@ fn rgb_to_hue(rgba: [u8; 4]) -> f32 {
         (r - g) / d + 4.0
     };
     (h / 6.0).rem_euclid(1.0)
+}
+
+/// The dynasty hue (0..1) for a lineage id — the golden-ratio mapping shared by
+/// the grazers on the meadow, the selection body/ring, and the bloodlines strip,
+/// so one dynasty is the same color everywhere it appears.
+fn lineage_hue(lineage: u32) -> f32 {
+    (lineage as f32 * 0.618_034).fract()
 }
 
 /// HSL (h,s,l all 0..1) to linear-ish RGB floats 0..1.
@@ -1223,9 +1576,26 @@ const INPUT_LABELS: [&str; 15] = [
     "const0", "const1", "osc", "age", "rand", "grad-ns", "grad-ew", // 0..6
     "N", "S", "E", "NE", "SE", "W", "NW", "SW", // 7..14 (move_vectors order)
 ];
+/// Herbivore forager sensorium labels, keyed to `eco::HERB_INPUTS` (12 inputs):
+/// bias, oscillator, own energy, random, biomass-here, the two-axis biomass
+/// gradient, four directional blocked-neighbour sensors, and local crowding.
+const HERB_INPUT_LABELS: [&str; 12] = [
+    "bias", "osc", "energy", "rand", "food", "grad-ns", "grad-ew", // 0..6
+    "blk-N", "blk-S", "blk-E", "blk-W", "crowd", // 7..11
+];
 const OUTPUT_LABELS: [&str; 5] = ["rand", "N", "S", "E", "W"];
-/// Cap on edges drawn in the brain panel; above this we keep the top-|weight|.
+/// Cap on edges drawn in the challenge brain panel; above this we keep the
+/// top-|weight|.
 const MAX_EDGES: usize = 120;
+/// Tighter edge cap for the eco herbivore's signal-flow panel — the ~30
+/// strongest connections, so the live wiring reads as one legible circuit.
+const HERB_MAX_EDGES: usize = 30;
+/// Live-signal magnitude (|source activation × weight|) that maps to a fully
+/// bright edge in the signal-flow inspector; stronger signals clamp here.
+const SIGNAL_FULL: f32 = 1.2;
+/// Output-neuron activation above which a movement output "fires" (the brain's
+/// `move_activation` threshold is 0.0); firing outputs flash in the inspector.
+const FIRE_THRESHOLD: f32 = 0.0;
 
 struct Edge {
     src_layer: u8,
@@ -1245,10 +1615,17 @@ struct BrainGraph {
 }
 
 impl BrainGraph {
-    /// Prune to the subgraph that can influence an output (backward reachability
-    /// from the output layer), then cap to the top MAX_EDGES by |weight|. Takes
-    /// the connections copied out of the ECS (the viewer holds no borrow).
+    /// Prune to the subgraph that can influence an output, capping at the
+    /// default [`MAX_EDGES`] (the challenge inspector's budget).
     fn build(conns: &[Connection]) -> BrainGraph {
+        Self::build_capped(conns, MAX_EDGES)
+    }
+
+    /// Prune to the subgraph that can influence an output (backward reachability
+    /// from the output layer), then cap to the top `max_edges` by |weight|. Takes
+    /// the connections copied out of the ECS (the viewer holds no borrow). The
+    /// eco herbivore panel passes a tighter [`HERB_MAX_EDGES`] cap.
+    fn build_capped(conns: &[Connection], max_edges: usize) -> BrainGraph {
         // reaches: inner nodes with a path forward to an output. Fixpoint over
         // connections (sink type 2 = output is terminal-true).
         let mut reaches: HashSet<u8> = HashSet::new();
@@ -1277,9 +1654,9 @@ impl BrainGraph {
             .collect();
         let active_total = edges.len();
 
-        if edges.len() > MAX_EDGES {
+        if edges.len() > max_edges {
             edges.sort_by(|a, b| b.weight.abs().partial_cmp(&a.weight.abs()).unwrap());
-            edges.truncate(MAX_EDGES);
+            edges.truncate(max_edges);
         }
 
         // Inner neurons that appear in the drawn edges.
@@ -1350,6 +1727,28 @@ fn draw_brain_panel(
     let Some(neurons) = sim.agent_neurons(entity) else {
         return;
     };
+    draw_brain_graph(gx, gy, gw, gh, g, &neurons, &INPUT_LABELS);
+}
+
+/// The shared signal-flow node-link renderer for a pruned [`BrainGraph`], drawn
+/// into the rect `(gx, gy, gw, gh)`. Inputs run down the left, inner neurons the
+/// middle, movement outputs the right. **Edges carry live signal**: colored by
+/// weight sign (blue excitatory / red inhibitory), thickness by |weight| (the
+/// stable structure) but brightness + alpha by the *live* signal magnitude
+/// |source activation × weight|, so active pathways light up and a quiet brain
+/// goes dark. Output nodes **flash** (a warm halo) on the frame they fire (cross
+/// the [`FIRE_THRESHOLD`]). `input_labels` names the sensor rows and sets how
+/// many input nodes to draw, so the same renderer serves the 15-input challenge
+/// agent and the 12-input eco herbivore.
+fn draw_brain_graph(
+    gx: f32,
+    gy: f32,
+    gw: f32,
+    gh: f32,
+    g: &BrainGraph,
+    neurons: &[Vec<f32>],
+    input_labels: &[&str],
+) {
     let x_in = gx + 46.0;
     let x_out = gx + gw - 46.0;
     let x_mid = (x_in + x_out) * 0.5;
@@ -1362,8 +1761,9 @@ fn draw_brain_panel(
             gy + gh * (i as f32 / (count - 1) as f32)
         }
     };
-    let input_y = |id: u8| pos_y(id as usize, 15);
-    let output_y = |id: u8| pos_y(id as usize, 5);
+    let n_in = input_labels.len();
+    let input_y = |id: u8| pos_y(id as usize, n_in);
+    let output_y = |id: u8| pos_y(id as usize, OUTPUT_LABELS.len());
     let inner_index: std::collections::HashMap<u8, usize> =
         g.inner_ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
     let inner_y = |id: u8| pos_y(*inner_index.get(&id).unwrap_or(&0), g.inner_ids.len());
@@ -1378,44 +1778,55 @@ fn draw_brain_panel(
         2 => output_y(id),
         _ => inner_y(id),
     };
+    let act = |layer: u8, id: u8| -> f32 {
+        neurons.get(layer as usize).and_then(|l| l.get(id as usize)).copied().unwrap_or(0.0)
+    };
 
-    // Edges first (under the nodes). Blue = positive, red = negative, fading
-    // toward the baseline gray as |weight| -> 0; thickness scales with |weight|.
+    // Edges first (under the nodes). Sign sets the hue; the live signal
+    // (source activation × weight) sets brightness/alpha, so the diagram shows
+    // what is *flowing* this tick, not just the static wiring.
     for e in &g.edges {
         let (x0, y0) = (node_x(e.src_layer), node_y(e.src_layer, e.src_id));
         let (x1, y1) = (node_x(e.sink_layer), node_y(e.sink_layer, e.sink_id));
-        let mag = (e.weight.abs().min(2.0) / 2.0).clamp(0.0, 1.0);
-        let thick = 0.6 + mag * 2.2;
+        let wmag = (e.weight.abs().min(2.0) / 2.0).clamp(0.0, 1.0);
+        let signal = (act(e.src_layer, e.src_id) * e.weight).abs();
+        let smag = (signal / SIGNAL_FULL).clamp(0.0, 1.0);
+        let thick = 0.6 + wmag * 2.2;
         let target = if e.weight >= 0.0 { SURVIVAL_HUE } else { EDGE_NEG };
-        // lerp baseline(383835) -> target by mag, with alpha rising too.
+        // A faint structural ghost (alpha 0.10) so quiet wiring stays readable,
+        // brightening toward the sign color as live signal grows.
         let col = Color::new(
-            lerp(BASELINE.r, target.r, mag),
-            lerp(BASELINE.g, target.g, mag),
-            lerp(BASELINE.b, target.b, mag),
-            0.22 + mag * 0.63,
+            lerp(BASELINE.r, target.r, smag),
+            lerp(BASELINE.g, target.g, smag),
+            lerp(BASELINE.b, target.b, smag),
+            0.10 + smag * 0.80,
         );
         draw_line(x0, y0, x1, y1, thick, col);
     }
 
     // Inner nodes (brightness by current activation).
     for &id in &g.inner_ids {
-        let a = neurons.get(1).and_then(|l| l.get(id as usize)).copied().unwrap_or(0.0);
-        draw_circle(x_mid, inner_y(id), 3.0, activation_color(a));
+        draw_circle(x_mid, inner_y(id), 3.0, activation_color(act(1, id)));
     }
 
     // Input nodes + labels (left).
-    for id in 0..15u8 {
-        let a = neurons.first().and_then(|l| l.get(id as usize)).copied().unwrap_or(0.0);
-        let ny = input_y(id);
-        draw_circle(x_in, ny, 4.0, activation_color(a));
-        draw_text(INPUT_LABELS[id as usize], gx, ny + 4.0, 13.0, MUTED);
+    for (id, label) in input_labels.iter().enumerate() {
+        let ny = input_y(id as u8);
+        draw_circle(x_in, ny, 4.0, activation_color(act(0, id as u8)));
+        draw_text(label, gx, ny + 4.0, 13.0, MUTED);
     }
-    // Output nodes + labels (right).
-    for id in 0..5u8 {
-        let a = neurons.get(2).and_then(|l| l.get(id as usize)).copied().unwrap_or(0.0);
-        let ny = output_y(id);
+    // Output nodes + labels (right). A firing output (activation over the
+    // movement threshold) flashes a warm halo — the creature's live decision.
+    for (id, label) in OUTPUT_LABELS.iter().enumerate() {
+        let a = act(2, id as u8);
+        let ny = output_y(id as u8);
+        if a > FIRE_THRESHOLD {
+            let fire = a.clamp(0.0, 1.0);
+            draw_circle(x_out, ny, 6.0 + 6.0 * fire, Color::new(1.0, 0.82, 0.36, 0.32 * fire));
+            draw_circle_lines(x_out, ny, 7.5, 1.6, Color::new(1.0, 0.88, 0.5, 0.75 * fire));
+        }
         draw_circle(x_out, ny, 5.0, activation_color(a));
-        draw_text(OUTPUT_LABELS[id as usize], x_out + 10.0, ny + 4.0, 13.0, TEXT_SECONDARY);
+        draw_text(label, x_out + 10.0, ny + 4.0, 13.0, TEXT_SECONDARY);
     }
 }
 

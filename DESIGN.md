@@ -272,17 +272,77 @@ arc) to be fully legible, which rides with the storytelling pass above.
 `flock` 1 → 56%, `ring` 3 → 62%, `orbit` 2 → 24%). Remaining: a viewer treatment
 for the two dynamic goals.*
 
-### 3. Phase C — CTRNN brains
-Upgrade neurons to continuous-time recurrent leaky integrators (per-neuron time
-constant + bias, persistent state across steps, inner↔inner recurrence) on the
-**same sparse connection genome**. Memory and timing are prerequisites for most
-interesting behavior — a feed-forward net cannot "remember where food was."
-- `--brain {feedforward,ctrnn}` so we A/B, not replace.
-- Stay CPU + rayon; burn/GPU was accidental complexity.
+### 3. Phase C — CTRNN brains *(done — and it closes the ctrnn-sim arc)*
+Neurons can now run as **continuous-time recurrent leaky integrators** with state
+that **persists across ticks** (reset only on birth), on the **same sparse
+connection genome** — feed-forward's per-step reset neutralized the inner→inner
+recurrence the genome already decodes; CTRNN makes it functional memory.
+- **Formulation** (`src/agent.rs`, `BrainKind::Ctrnn`): standard CTRNN, Euler
+  `dt=1`, `y_i += (1/tau_i)·(−y_i + Σ_j w_ij·a_j)`, activation `a_i = tanh(y_i +
+  bias_i)`; inputs enter as raw `a` through input→neuron genes (no separate drive
+  term). Currents are summed from **last tick's** activations before any state
+  updates (synchronous), so inner→inner loops feed back a delayed signal — the
+  memory. **tau/bias choice** (minimal, justified): per-neuron `tau` is a fixed
+  **geometric spread 2→20 ticks across the inner layer** (fast reactive → slow
+  mnemonic integrators — multi-timescale memory for free) and `tau=1` for outputs
+  (instantaneous read-out, so motor lag lives only where wired); `bias=0`. No
+  genome extension — evolution shapes memory through the connection weights /
+  which recurrent loops form (the sparse-genome search space), keeping the genome
+  encoding untouched and feed-forward byte-identical.
+- `--brain {feedforward,ctrnn,mixed}` (default feedforward). **Determinism:** two
+  same-seed `--brain ctrnn` runs are byte-identical, and `--brain feedforward` is
+  **byte-identical to the pre-CTRNN baseline** (eco + challenge, verified by diff).
+  CPU + rayon only; CTRNN adds **no measurable tick cost** in eco (~900 ticks/s
+  either way — the plant CA over 16 384 cells dwarfs the brain step).
 
-*Gate: CTRNN beats feed-forward on `moving-band` and `enclosure` (the tasks that
-reward memory), shown as paired baseline curves. If it doesn't, understand why
-before proceeding.*
+*Original gate (CTRNN beats FF on `moving-band`/`enclosure`): **not met, honestly.**
+FF ties or beats CTRNN on every challenge navigation task (moving-band 46 vs 41 %,
+enclosure 18 vs 14 %, gauntlet 93 vs 93 %) — they are reactively solvable, so
+memory doesn't pay and CTRNN's integration lag is a small net cost.*
+
+**The mixed-competition demonstration (the redemption task) and its honest result.**
+The eco terrarium was built believing foraging with local senses *demands* memory
+("remember where the food was"). Tagged each creature feed-forward-vs-CTRNN
+(inherited by offspring), seeded the meadow 50/50, and measured the CTRNN
+population share over time (`--brain mixed`, multiple seeds). **Result: CTRNN
+loses.** Head-to-head it is driven to ~0 % share by tick ~10 000 on every seed
+(seed 42, predators off: share 50 % → 65 % @1k (founder bloom) → 27 % @3k → 6 %
+@5k → **0 % @10k**; seeds 7/123 the same), with *or without* directional food
+sensing. **Diagnosis (the ctrnn-sim lesson, reconfirmed):** the task is reactively
+solvable — local gradient-following + straight-line search suffice, so memory buys
+no decisive edge, while a **random-genome CTRNN is handicapped** (untamed
+recurrence injects noise; lag delays reactions). FF gets a clean reactive
+controller from the *same* random genomes, out-reproduces CTRNN from tick 0, and
+the exponential head start is unrecoverable. Ecosystem changes tried to force a
+memory gradient (a `herb_sense_gradient=false` knob that puts food *out of view*
+unless stepped on; lower density; depleting patches; `move_cost=0`) did **not**
+flip the head-to-head outcome. A paired **separate-world** comparison *looks* like
+a CTRNN win (CTRNN-only sustains +15–40 % more herbivores) but is a **confound,
+not memory** — the edge is *larger with the gradient than without*, i.e. a
+movement/energy dynamics artifact (the meadow's population is food-limited, so
+head-count tracks food influx, not foraging skill). Reported, not dressed up as a
+win — that dressing-up is exactly the ctrnn-sim mistake.
+
+**The clean, earned win — a task that *provably* rewards memory** (`src/memtask.rs`,
+`--mem-bench`). A delayed-recall benchmark: a cue is shown for the first few ticks
+of an episode, then removed; the brain must report it after it is gone. At report
+time a feed-forward net's inputs are identical whichever cue it saw, so **it is
+pinned at chance (0.500) by construction** — no wiring can recall. A CTRNN latches
+the cue into persistent state and reads it back. Same genome, same `mutate_genome`,
+same everything but the neuron dynamics. **Result (seeds 42/7/123 identical):
+feed-forward stays at 0.500 forever; CTRNN climbs 0.53 → 0.76 (gen 8) → 0.91
+(gen 16) → 1.000 (gen 32) — perfect recall. Memory wins by +0.500.** This is the
+substrate ctrnn-sim wanted, now *demonstrated* on a task that rewards it.
+
+*Closes the ctrnn-sim arc.* ctrnn-sim died at "works but sucks" because it built
+the CTRNN substrate with **no task that rewarded recurrence** (it jumped to MNIST,
+where random nets sit at chance, so selection was drift). This rung built the same
+substrate **and** established the signal discipline around it: (1) proved the
+substrate delivers memory a feed-forward net cannot, on a task that provably needs
+it (recall: +0.500); and (2) refused to fake the terrarium result — honestly
+measuring that grid foraging, despite the intuition, is reactively solvable and so
+does **not** reward memory. Signal before substrate, held to even when it means
+reporting that the headline task didn't need the substrate after all.
 
 ### 4. Continuous world + energy/food
 The biggest unlock: make survival **behavioral** (forage, don't starve) instead

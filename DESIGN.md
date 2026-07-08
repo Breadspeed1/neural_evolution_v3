@@ -111,6 +111,66 @@ Every step in this roadmap obeys the inversion of that mistake:
   Sustained *global* oscillation stays damped (the producer base's own strong
   self-regulation plus spatial averaging over 16 384 cells), so what persists is
   a stable coexistence with an opening cycle rather than a limit cycle.
+- **Ecosystem terrarium — predators** *(rung 3 of the ecosystem ladder;
+  `--mode eco`)*: the **apex trophic level** and the project's **first
+  multi-species coevolution**, completing the pyramid soil → plants → herbivores →
+  predators. Herbivores and predators are both mobile hecs entities sharing one
+  `Creature` bundle (`Position` + genome/brain/energy/lineage) tagged by a
+  **`Species { Herbivore, Predator }`** enum; a **single stable `order`** covers
+  both species (position-in-`order` = the per-entity RNG index, one
+  `creature_seed(seed, tick, index)` stream), and the serial entity phase iterates
+  it **twice** — grazers first (rung-2 logic verbatim, so a herbivore-only run is
+  byte-identical), then hunters — branching on species. Predators reuse the
+  feed-forward [`Brain`] over a **13→12-input hunting sensorium** (`PRED_INPUTS`:
+  bias/oscillator/own-energy/random, a wide-radius **prey-density** scalar + a
+  distance-weighted **prey-direction** NS/EW gradient, four directional
+  blocked-neighbour sensors, and own-species **pack** spacing). Each tick a
+  predator senses → brain → moves (up to `pred_speed` cells, cell-by-cell) →
+  **catches** the first adjacent herbivore (prey dies; predator assimilates
+  `catch_efficiency` of its energy, the remainder → soil), pays metabolism, then
+  starves (corpse → nutrient) or reproduces (mutated child, energy split). Caught
+  prey are removed from `order` in the same order-stable, index-preserving way as
+  starvation (deaths collected in a `dead_set`, applied once after both
+  sub-phases; a prey born *and* eaten in one tick counts as a birth and a death
+  and never joins `order`). **Scale separation** (the "birds" flavour): predators
+  sense prey over radius **4** (vs the herbivore's single-cell biomass gradient)
+  and move **2** cells/tick (vs 1) — a distinct, faster hunting scale.
+  **Determinism preserved**: two same-seed eco runs (predators on) are
+  byte-identical JSONL (verified by diff); the challenge sim is untouched and
+  stays byte-identical. `EcoMetrics` gains predator count / births / deaths /
+  mean-energy; the viewer draws predators as **warm-red apex chevrons** over the
+  grazer dots, adds a **predator population sparkline** (the full soil → plants →
+  herbivores → predators readout), and extends selection + the signal-flow brain
+  inspector to predators (`p` picks the fattest hunter; the panel switches to the
+  predator sensor labels). **Tri-trophic coexistence gate met** (seeds 42/7/123,
+  128², committed defaults, **no reseeding**): from 150 herbivore + 26 predator
+  founders the meadow blooms (coverage 0.9 % → 55 % by tick 200), herbivores boom
+  in its wake (→ ~520 by tick 500), predators **lag-peak** trailing them (→ ~160
+  by tick 1000, ~500 ticks behind the prey peak) and crash the herbivore boom,
+  after which the three levels settle into a **persistent, self-sustaining, lagged
+  oscillation that runs to 50 000 ticks on every seed tested** (seed 42: herbivores
+  swing ~15–730, predators ~26–274, plant coverage ~33–39 %, biomass ~4400–4700,
+  all bounded away from zero; seeds 7 and 123 the same band). The balance is a
+  **top-down trophic cascade** (the "green world"): predators hold herbivores far
+  below their food carrying capacity (~2000 without predators → ~100s with them),
+  so the meadow stays **lush** at ~33 % coverage rather than being grazed to the
+  rung-2 ~13 %. Three things make the coexistence robust rather than a
+  Lotka–Volterra death spiral — the genuinely hard part of the 3-level balance:
+  **(1) a *moderate* sensing radius (4).** Wider radii (tested 6–10) make the hunt
+  *mean-field* — every predator sees the whole prey field, so local prey
+  depletions synchronize into one global predator crash and the system spirals to
+  extinction (radius-6/9 configs collapse on 2 of 3 seeds). Radius 4 keeps the
+  hunt **spatially structured**: many asynchronous local predator–prey cycles
+  average into a stable global coexistence, and sparse low-density prey patches are
+  a refuge the short-sighted predators can't find. **(2) Deep predator energy
+  reserves** (`pred_energy_max` 80 vs metabolism 0.045 ≈ **1800 ticks** of famine
+  buffer) so predators *coast through* a prey trough instead of starving out at it
+  — the same reserve-buffer principle that made the rung-2 herbivore layer robust,
+  applied to the apex tier (shallow reserves ⇒ extinction in the first deep
+  trough). **(3) Modest per-catch value + slow reproduction** (efficiency 0.6, a
+  high repro threshold of 42, and a hard cap of **one catch per predator per
+  tick**) keep predators from over-multiplying and cropping the prey to zero. See
+  the balance discussion under roadmap step 6.
 - **Core sim**: parallel (rayon) step, seeded ChaCha8 determinism (reproducible
   across the parallel decision phase), geometric-skip mutation.
 - **Harness**: lib + headless/viewer bins, clap CLI, per-generation JSONL
@@ -262,16 +322,33 @@ from memory (3) and signaling fields (5).
 *Gate: coupled population dynamics (Lotka–Volterra-like oscillation) and at least
 one evolved pursuit or evasion behavior.*
 
-*Now concretely the **next eco rung (rung 3)**: add a carnivore trophic level on
-top of rung 2's herbivores — the coupled plant↔herbivore dynamics and the
-byte-identical serial-entity-phase machinery are already in place, so rung 3 is a
-second entity species that senses + eats herbivores (prey energy → predator
-energy, closing the pyramid). The rung-2 handoff seams for it: herbivores already
-carry energy + lineage and die into the nutrient field; a predator reuses the
-same `Position` + brain-bundle + `order`/`herbivore_seed` determinism pattern,
-adds a "nearest prey" sensor, and turns a catch into an energy transfer + a
-herbivore death. CTRNN brains (roadmap 3) and the pheromone field (roadmap 5)
-compose with it but are not prerequisites.*
+*Landed as the eco terrarium's **rung 3** (`--mode eco`, predators; see "Where we
+are").* The coupled population dynamics gate is **met**: predators and prey trace a
+persistent **lagged oscillation** (predator peaks trailing prey peaks by ~500
+ticks) that self-sustains to 50 000 ticks across seeds 42/7/123 with no reseeding,
+on a lush plant base — a top-down trophic cascade, the full soil → plants →
+herbivores → predators pyramid. Predators reuse rung-2's seams exactly: the
+`Position` + brain-bundle + single-`order`/`creature_seed` determinism pattern
+(now shared by both species behind a `Species` tag), a wide-radius prey sensor,
+and a catch = herbivore death + energy transfer. **The 3-level balance was the
+hard part** — the naive tuning collapses (predators too effective → prey wiped →
+predators starve; or too weak → predators die out → back to rung 2). What makes it
+coexist: a *moderate* (spatially-structured, not mean-field) predator sensing
+radius so local cycles don't synchronize into a global crash, **deep predator
+energy reserves** that coast through prey troughs, and modest per-catch value +
+slow reproduction (+ one catch/tick) so predators can't crop the prey to zero (the
+full numbers + reasoning are in the rung-3 bullet above). *Evolved pursuit/evasion
+is latent but not yet isolated as a paired baseline curve — the prey-direction
+sensor makes pursuit selectable, and herbivores sensing predator-occupied
+neighbours as "blocked" makes evasion selectable — a natural next readout.*
+**Open seams from here:** (a) **CTRNN brains** (roadmap 3) give memory-based
+hunting/foraging — a predator that remembers where prey was last seen, or a prey
+that flees a *remembered* threat direction — which the current feed-forward brain
+cannot; the sparse connection genome + `--brain` A/B seam compose directly with
+both species. (b) **Niche enrichment**: a second prey or predator species, size/
+speed trait axes, evolvable pack-hunting off the `pack` sensor, or the pheromone
+field (roadmap 5) as a shared alarm/trail channel — each is an additive
+`Species`/sensor variant on the same order/determinism backbone, not a rewrite.
 
 ### Deferred / lower priority
 - **Communication channels** (an output other agents can sense): evolvable

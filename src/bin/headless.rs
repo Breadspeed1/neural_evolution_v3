@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use clap::Parser;
+use neural_evolution::memtask::run_recall_benchmark;
 use neural_evolution::{Cli, Mode, build_eco_sim, build_simulator};
 
 /// Headless runner: no window. In `challenge` mode runs the generational sim to
@@ -9,10 +10,41 @@ use neural_evolution::{Cli, Mode, build_eco_sim, build_simulator};
 /// `--bench` runs a fixed 50-generation challenge benchmark and prints gens/sec.
 fn main() {
     let cli = Cli::parse();
+    if cli.mem_bench {
+        run_mem_bench(&cli);
+        return;
+    }
     match cli.mode {
         Mode::Challenge => run_challenge(&cli),
         Mode::Eco => run_eco(&cli),
     }
+}
+
+/// The delayed-recall memory benchmark: a paired feed-forward vs CTRNN evolution
+/// on a task that provably needs memory (a cue shown early, removed, reported
+/// after). Prints both learning curves so the gap is a measured A/B. Feed-forward
+/// is pinned at chance (0.50) by construction; only the CTRNN can climb.
+fn run_mem_bench(cli: &Cli) {
+    let seed = cli.seed.unwrap_or(42);
+    let generations = cli.generations.unwrap_or(80);
+    let population = 160usize;
+    println!(
+        "delayed-recall memory benchmark (seed {seed}, {generations} gens, pop {population})"
+    );
+    println!("  a cue is shown for the first ticks, then removed; the brain must report it after.");
+    println!("  feed-forward is pinned at chance (0.50) — its inputs are identical once the cue is gone.");
+    let r = run_recall_benchmark(seed, generations, population);
+    println!("\n   gen   feed-forward   ctrnn");
+    let marks = [0usize, 4, 8, 12, 16, 24, 32, 48, 64, generations as usize - 1];
+    for &g in marks.iter().filter(|&&g| g < r.ctrnn_curve.len()) {
+        println!("  {:>4}      {:>6.3}     {:>6.3}", g, r.ff_curve[g], r.ctrnn_curve[g]);
+    }
+    let ff_best = r.ff_curve.iter().cloned().fold(0.0f32, f32::max);
+    let ct_best = r.ctrnn_curve.iter().cloned().fold(0.0f32, f32::max);
+    println!(
+        "\n  best fitness:  feed-forward {ff_best:.3} (≈chance)   ctrnn {ct_best:.3}  →  memory wins by {:.3}",
+        ct_best - ff_best
+    );
 }
 
 fn run_challenge(cli: &Cli) {

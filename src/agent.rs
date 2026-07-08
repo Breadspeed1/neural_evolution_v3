@@ -9,6 +9,44 @@ pub mod binary_util;
 /// challenge agent's layout so its behavior is byte-identical to before.
 pub(crate) const AGENT_INPUTS: usize = 17;
 
+/// Which neuron dynamics a [`Brain`] runs. Both variants decode the **same**
+/// sparse connection genome — they differ only in how neurons update each step:
+///
+/// - `Feedforward`: neurons are reset to 0 every step, then one forward pass with
+///   `tanh` activation. Recurrent (inner→inner) genes still decode, but the
+///   per-step reset neutralizes them, so the brain is **memoryless**. This is the
+///   original behavior; a `Feedforward` brain is byte-identical to before.
+/// - `Ctrnn`: neurons are continuous-time leaky integrators whose state
+///   **persists across steps** (reset only on birth). The same recurrent genes
+///   now become functional memory — a neuron can hold a past input after it is
+///   gone. Per-neuron time constants; see [`Brain::step_ctrnn`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrainKind {
+    #[default]
+    Feedforward,
+    Ctrnn,
+}
+
+/// CTRNN Euler timestep. One sim tick = one integration step (`dt = 1`), so a
+/// neuron's time constant `tau` is measured directly in ticks.
+const CTRNN_DT: f32 = 1.0;
+/// Inner-neuron time constants are spread **geometrically** across this range, so
+/// the brain owns both fast (near-reactive) and slow (long-memory) integrators. A
+/// neuron with `tau = t` retains ~`(1 - dt/t)` of its state each tick — an
+/// exponential memory of ~`t` ticks. This spread is the substrate the recurrent
+/// genes exploit; evolution picks which timescales to wire into loops.
+const CTRNN_TAU_INNER_MIN: f32 = 2.0;
+const CTRNN_TAU_INNER_MAX: f32 = 20.0;
+/// Output neurons integrate fast (`tau = 1` ⇒ an instantaneous read-out of their
+/// input current), so movement tracks the recurrent inner state without extra
+/// lag — the memory lives in the inner layer, the outputs just read it out.
+const CTRNN_TAU_OUTPUT: f32 = 1.0;
+/// Per-neuron bias (the operating point of the `tanh`). Zero keeps the resting
+/// state at 0 and the genome unchanged; evolution shapes the dynamics through the
+/// connection weights (the sparse-genome search space), not per-neuron biases.
+const CTRNN_BIAS: f32 = 0.0;
+
 /// The per-creature component bundle: everything about an agent *except* its
 /// spatial position, which lives in a separate `Position` component (position is
 /// queried far more often than the brain, so keeping it a small standalone
@@ -31,6 +69,9 @@ pub struct Agent {
     brain: Brain,
     rgba: [u8; 4],
     amt_inners: u8,
+    /// Feed-forward or CTRNN dynamics — inherited verbatim by children. Held so a
+    /// child rebuilds its brain with the same dynamics as its parent.
+    kind: BrainKind,
 }
 
 impl Clone for Agent {
@@ -42,20 +83,27 @@ impl Clone for Agent {
             brain: self.brain.clone(),
             rgba: self.get_rgba(),
             amt_inners: self.amt_inners,
+            kind: self.kind,
         }
     }
 }
 
 impl Agent {
-    pub fn new(genome: &[u32], amt_inners: u8, lineage: u32) -> Agent {
+    pub fn new(genome: &[u32], amt_inners: u8, lineage: u32, kind: BrainKind) -> Agent {
         Agent {
             genome: genome.to_vec(),
             lineage,
             accumulated_angle: 0.0,
-            brain: Brain::from(genome.to_vec(), AGENT_INPUTS, amt_inners),
+            brain: Brain::from(genome.to_vec(), AGENT_INPUTS, amt_inners, kind),
             rgba: Agent::calc_rgba(genome),
             amt_inners,
+            kind,
         }
+    }
+
+    /// Which brain dynamics this agent runs (feed-forward or CTRNN).
+    pub fn brain_kind(&self) -> BrainKind {
+        self.kind
     }
 
     /// Number of inner neurons the brain was built with (needed to build a
@@ -98,7 +146,7 @@ impl Agent {
 
     pub fn produce_child(&self, mutation_rate: f32, rng: &mut ChaCha8Rng) -> Agent {
         let genome = mutate_genome(&self.genome, mutation_rate, rng);
-        Agent::new(&genome, self.amt_inners, self.lineage)
+        Agent::new(&genome, self.amt_inners, self.lineage, self.kind)
     }
 
     pub fn get_rgba(&self) -> [u8; 4] {
@@ -167,7 +215,23 @@ pub(crate) struct Brain {
     used_input_ids: Vec<usize>,
     connections: Vec<Connection>,
     neurons: Vec<Vec<f32>>,
-    move_vec: Vec<(i32, i32)>
+    move_vec: Vec<(i32, i32)>,
+    /// Neuron dynamics: feed-forward (reset each step) or CTRNN (persistent
+    /// state). Selects the `step` path; the decoded genome is identical either way.
+    kind: BrainKind,
+    /// CTRNN persistent state `y_i` per neuron, indexed `[layer][id]` exactly like
+    /// `neurons` (layer 0 = inputs, unused; 1 = inner; 2 = output). Carried across
+    /// ticks — this vector *is* the memory — and reset to 0 only on birth (a fresh
+    /// `Brain`). Empty for a feed-forward brain (which allocates none of this).
+    state: Vec<Vec<f32>>,
+    /// CTRNN per-neuron time constants, same `[layer][id]` shape as `state`. Empty
+    /// for a feed-forward brain.
+    tau: Vec<Vec<f32>>,
+    /// CTRNN per-neuron bias, same shape as `state`. Empty for feed-forward.
+    bias: Vec<Vec<f32>>,
+    /// CTRNN per-step scratch for the summed input current `I_i`, same shape as
+    /// `state`. Held on the struct to avoid a per-step allocation. Empty for FF.
+    currents: Vec<Vec<f32>>,
 }
 
 impl Clone for Brain {
@@ -178,13 +242,18 @@ impl Clone for Brain {
             used_input_ids: self.used_input_ids.clone(),
             connections: self.connections.clone(),
             neurons: self.neurons.clone(),
-            move_vec: self.move_vec.clone()
+            move_vec: self.move_vec.clone(),
+            kind: self.kind,
+            state: self.state.clone(),
+            tau: self.tau.clone(),
+            bias: self.bias.clone(),
+            currents: self.currents.clone(),
         }
     }
 }
 
 impl Brain {
-    pub(crate) fn from(genome: Vec<u32>, num_inputs: usize, amt_inners: u8) -> Brain {
+    pub(crate) fn from(genome: Vec<u32>, num_inputs: usize, amt_inners: u8, kind: BrainKind) -> Brain {
         let mut out: Brain = Brain {
             genome,
             move_activation: 0.0,
@@ -200,12 +269,48 @@ impl Brain {
             (0, -1),
             (1, 0),
             (-1, 0)
-            ]
+            ],
+            kind,
+            state: Vec::new(),
+            tau: Vec::new(),
+            bias: Vec::new(),
+            currents: Vec::new(),
         };
 
         out.generate_connections();
 
+        if kind == BrainKind::Ctrnn {
+            out.init_ctrnn();
+        }
+
         out
+    }
+
+    /// Allocate + initialize the CTRNN state buffers (once, at construction, for a
+    /// `Ctrnn` brain). State starts at 0 — a fresh brain has no memory. Per-neuron
+    /// `tau` is a geometric spread over the inner layer (fast→slow integrators)
+    /// and `CTRNN_TAU_OUTPUT` for the outputs; `bias` is `CTRNN_BIAS`. Every buffer
+    /// mirrors `neurons`' `[layer][id]` shape (layer 0 present but unused), so a
+    /// connection's sink/source layer tags index them directly.
+    fn init_ctrnn(&mut self) {
+        self.state = self.neurons.iter().map(|l| vec![0.0; l.len()]).collect();
+        self.currents = self.neurons.iter().map(|l| vec![0.0; l.len()]).collect();
+        self.bias = self.neurons.iter().map(|l| vec![CTRNN_BIAS; l.len()]).collect();
+        // tau defaults to 1.0; the inner layer gets the geometric spread and the
+        // output layer the fast read-out constant.
+        self.tau = self.neurons.iter().map(|l| vec![1.0; l.len()]).collect();
+        let inner_n = self.neurons[1].len();
+        for (i, t) in self.tau[1].iter_mut().enumerate() {
+            *t = if inner_n <= 1 {
+                CTRNN_TAU_INNER_MIN
+            } else {
+                let f = i as f32 / (inner_n - 1) as f32;
+                CTRNN_TAU_INNER_MIN * (CTRNN_TAU_INNER_MAX / CTRNN_TAU_INNER_MIN).powf(f)
+            };
+        }
+        for t in &mut self.tau[2] {
+            *t = CTRNN_TAU_OUTPUT;
+        }
     }
 
     /// Read-only view of the decoded connections (for the viewer's brain
@@ -224,10 +329,68 @@ impl Brain {
     }
 
     pub(crate) fn step(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
+        if self.kind == BrainKind::Ctrnn {
+            return self.step_ctrnn(input, rng);
+        }
+        // Feed-forward: reset, one forward pass, read the outputs. Unchanged from
+        // the original (byte-identical), only the motor decode is now shared.
         self.reset_all();
         self.neurons[0] = input;
         self.calculate_all();
+        self.decode_movement(rng)
+    }
 
+    /// One continuous-time recurrent update (Euler, `dt = CTRNN_DT`). For each
+    /// non-input neuron `i`:
+    ///
+    /// > `y_i += (dt / tau_i) * ( -y_i + Σ_j w_ij · a_j )`
+    ///
+    /// where `a_j` is the *activation* of source `j` — the raw input for an input
+    /// neuron, or `tanh(y_j + bias_j)` for an inner neuron read at its **previous**
+    /// step's value (the recurrent signal). All currents are summed from the
+    /// connections *before* any state is updated (a synchronous update), so an
+    /// inner→inner loop feeds back last tick's activation — the persistent memory
+    /// a feed-forward brain lacks. Output activations are then read by the shared
+    /// motor decoder. State persists across calls; only birth (a fresh `Brain`)
+    /// clears it.
+    fn step_ctrnn(&mut self, input: Vec<f32>, rng: &mut ChaCha8Rng) -> (i32, i32) {
+        self.neurons[0] = input;
+
+        // Sum the input current into each inner/output neuron from the *current*
+        // activations: inputs were just set; inner/output hold last step's tanh.
+        for layer in 1..self.currents.len() {
+            for v in &mut self.currents[layer] {
+                *v = 0.0;
+            }
+        }
+        for c in &self.connections {
+            let a_src = self.neurons[c.source_type as usize][c.source_id as usize];
+            self.currents[c.sink_type as usize][c.sink_id as usize] += c.weight * a_src;
+        }
+
+        // Euler-integrate the leaky state, then refresh activations
+        // `a_i = tanh(y_i + bias_i)` for the inner + output layers.
+        for layer in 1..self.state.len() {
+            for i in 0..self.state[layer].len() {
+                let y = self.state[layer][i];
+                let dy = (CTRNN_DT / self.tau[layer][i]) * (-y + self.currents[layer][i]);
+                let y_new = y + dy;
+                self.state[layer][i] = y_new;
+                self.neurons[layer][i] = ((y_new + self.bias[layer][i]) as f64).tanh() as f32;
+            }
+        }
+
+        self.decode_movement(rng)
+    }
+
+    /// Read the 5 movement outputs (`neurons[2]`) into a translation, shared by
+    /// both brain kinds so their motor decoding is identical: output 0 (over the
+    /// `move_activation` threshold) adds a random ±1 jitter, outputs 1..5 add their
+    /// cardinal direction, the sum clamped to a unit step. The single conditional
+    /// RNG draw (only when output 0 fires) matches the original feed-forward decode
+    /// exactly, so a feed-forward brain's behavior — and its RNG-stream
+    /// consumption — is byte-identical to before.
+    fn decode_movement(&self, rng: &mut ChaCha8Rng) -> (i32, i32) {
         let mut request = (0, 0);
 
         if self.neurons[2][0] > self.move_activation {
@@ -377,7 +540,7 @@ mod tests {
             | (1 << 16)              // sign = 1 -> positive
             | (16000u32 << 17);      // weight raw = 16000 -> 16000/16000 = 1.0
 
-        let brain = Brain::from(vec![dec], 17, 10);
+        let brain = Brain::from(vec![dec], 17, 10, BrainKind::Feedforward);
         assert_eq!(brain.connections.len(), 1);
         let c = &brain.connections[0];
         assert_eq!(c.source_type, 0);
@@ -385,6 +548,90 @@ mod tests {
         assert_eq!(c.sink_type, 2);
         assert_eq!(c.sink_id, 3);
         assert_eq!(c.weight, 1.0);
+    }
+
+    /// Two hand-built genes: `input0 → inner0` (+1) and `inner0 → output0` (+1).
+    /// Packing per `gene_decodes_to_expected_connection`.
+    fn mem_genome() -> Vec<u32> {
+        // input0 -> inner0 : source_type 0, source_id 0, sink_type raw 0 (inner),
+        // sink_id 0, sign 1, magnitude 16000 (weight +1.0).
+        let in_inner = (1u32 << 16) | (16000u32 << 17);
+        // inner0 -> output0 : source_type 1, source_id 0, sink_type raw 1 (output),
+        // sink_id 0, sign 1, magnitude 16000.
+        let inner_out = 1u32 | (1u32 << 7) | (1u32 << 16) | (16000u32 << 17);
+        vec![in_inner, inner_out]
+    }
+
+    #[test]
+    fn ctrnn_remembers_a_past_input_but_feedforward_does_not() {
+        // The headline CTRNN property: an inner neuron holds a memory of a past
+        // input after that input is removed. The feed-forward brain resets each
+        // step, so the same neuron is back to 0 once the drive is gone.
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+
+        let mut ctrnn = Brain::from(mem_genome(), 4, 4, BrainKind::Ctrnn);
+        ctrnn.step(vec![1.0, 0.0, 0.0, 0.0], &mut rng); // drive the input high
+        let charged = ctrnn.neurons()[1][0];
+        assert!(charged.abs() > 0.1, "CTRNN inner should charge from the input: {charged}");
+        ctrnn.step(vec![0.0, 0.0, 0.0, 0.0], &mut rng); // remove the input
+        let remembered = ctrnn.neurons()[1][0];
+        assert!(
+            remembered.abs() > 0.05,
+            "CTRNN inner must retain state after the input is removed: {remembered}"
+        );
+
+        let mut ff = Brain::from(mem_genome(), 4, 4, BrainKind::Feedforward);
+        ff.step(vec![1.0, 0.0, 0.0, 0.0], &mut rng);
+        ff.step(vec![0.0, 0.0, 0.0, 0.0], &mut rng);
+        assert_eq!(
+            ff.neurons()[1][0],
+            0.0,
+            "feed-forward inner resets to 0 once the input is gone (no memory)"
+        );
+    }
+
+    #[test]
+    fn ctrnn_integrates_repeated_input_feedforward_is_static() {
+        // A leaky integrator builds up over repeated identical input (integration
+        // across steps); the memoryless feed-forward brain produces the same inner
+        // value every identical step.
+        let genome = vec![(1u32 << 16) | (16000u32 << 17)]; // input0 -> inner0, +1
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+
+        let mut ctrnn = Brain::from(genome.clone(), 4, 4, BrainKind::Ctrnn);
+        let mut prev = 0.0f32;
+        let mut rose = 0;
+        for _ in 0..5 {
+            ctrnn.step(vec![1.0, 0.0, 0.0, 0.0], &mut rng);
+            let a = ctrnn.neurons()[1][0];
+            if a > prev + 1e-6 {
+                rose += 1;
+            }
+            prev = a;
+        }
+        assert!(rose >= 3, "CTRNN inner should build up over repeated input (integration)");
+
+        let mut ff = Brain::from(genome, 4, 4, BrainKind::Feedforward);
+        ff.step(vec![1.0, 0.0, 0.0, 0.0], &mut rng);
+        let a1 = ff.neurons()[1][0];
+        ff.step(vec![1.0, 0.0, 0.0, 0.0], &mut rng);
+        let a2 = ff.neurons()[1][0];
+        assert_eq!(a1, a2, "feed-forward inner is identical every identical step (no integration)");
+    }
+
+    #[test]
+    fn ctrnn_tau_spread_is_monotone_fast_to_slow() {
+        // The inner layer's time constants are a geometric spread from the fast
+        // (reactive) end to the slow (long-memory) end — the multi-timescale
+        // substrate. Build a wide brain and check tau rises across the inner layer.
+        let brain = Brain::from(vec![0u32; 4], 8, 16, BrainKind::Ctrnn);
+        let tau = &brain.tau[1];
+        assert!((tau[0] - CTRNN_TAU_INNER_MIN).abs() < 1e-4, "first inner is the fastest");
+        assert!(
+            (tau[tau.len() - 1] - CTRNN_TAU_INNER_MAX).abs() < 1e-3,
+            "last inner is the slowest"
+        );
+        assert!(tau.windows(2).all(|w| w[1] >= w[0]), "tau must be non-decreasing across inners");
     }
 
     #[test]

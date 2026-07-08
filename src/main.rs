@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use hecs::Entity;
 use macroquad::prelude::*;
-use neural_evolution::agent::Connection;
+use neural_evolution::agent::{BrainKind, Connection};
 use neural_evolution::eco::{CreatureView, EcoMetrics, EcoSim, Species};
 use neural_evolution::grid::Cell;
 use neural_evolution::{AgentView, Cli, Mode, Simulator, build_eco_sim, build_simulator};
@@ -829,7 +829,7 @@ fn draw_eco_dashboard(
     let legend_y = screen_height() - MARGIN - legend_h;
     draw_text(legend, col_x, legend_y + 17.0, 14.0, MUTED);
 
-    let status_h = 214.0;
+    let status_h = 234.0;
     draw_eco_status_panel(eco, col_x, y, col_w, status_h, target_sps, unlimited, display, spotlight);
     y += status_h + MARGIN;
 
@@ -892,7 +892,25 @@ fn draw_eco_status_panel(
     let pred_energy = m.map(|m| m.pred_mean_energy).unwrap_or(0.0);
     let pred_births = m.map(|m| m.pred_births).unwrap_or(0);
     let pred_deaths = m.map(|m| m.pred_deaths).unwrap_or(0);
+    let ctrnn_herb = m.map(|m| m.ctrnn_population).unwrap_or(0);
+    let ctrnn_pred = m.map(|m| m.ctrnn_predators).unwrap_or(0);
     let speed = if unlimited { "unlimited".to_string() } else { format!("{:.0}/s", target_sps) };
+
+    // Brain-type readout: the run's brain dynamics, and for a mixed run the live
+    // feed-forward vs CTRNN herbivore population shares — the A/B competition made
+    // watchable (feed-forward has no CTRNN creatures, so it just names the mode).
+    let ff_herb = population.saturating_sub(ctrnn_herb);
+    let ff_pred = predators.saturating_sub(ctrnn_pred);
+    let brains_val = if population == 0 && predators == 0 {
+        "—".to_string()
+    } else if ctrnn_herb == 0 && ctrnn_pred == 0 {
+        "feed-forward".to_string()
+    } else if ff_herb == 0 && ff_pred == 0 {
+        "ctrnn (recurrent)".to_string()
+    } else {
+        let ct_pct = ctrnn_herb as f64 * 100.0 / population.max(1) as f64;
+        format!("mixed  ·  FF {:.0}%   CTRNN {:.0}%", 100.0 - ct_pct, ct_pct)
+    };
 
     let label_x = x + pad;
     let value_x = x + pad + 118.0;
@@ -910,6 +928,7 @@ fn draw_eco_status_panel(
     row("  flux", &format!("+{births} births  ·  -{deaths} deaths"), MUTED, &mut ly);
     row("predators", &format!("{predators}  ·  mean-E {pred_energy:.2}"), PRED_HUE, &mut ly);
     row("  flux", &format!("+{pred_births} births  ·  -{pred_deaths} deaths"), MUTED, &mut ly);
+    row("brains", &brains_val, TEXT_SECONDARY, &mut ly);
     row(
         "view",
         &format!("{speed}   display {}   spotlight {}", if display { "on" } else { "off" }, if spotlight { "on" } else { "off" }),
@@ -1077,11 +1096,19 @@ fn draw_eco_brain_panel(
     // The header + sensor-row labels follow the selection's species: a grazer's
     // forager sensorium or a predator's hunting sensorium.
     let species = sel_view.map(|v| v.species);
-    let (title, labels): (&str, &[&str]) = match species {
+    let (base, labels): (&str, &[&str]) = match species {
         Some(Species::Predator) => ("brain - predator", &PRED_INPUT_LABELS),
         _ => ("brain - grazer", &HERB_INPUT_LABELS),
     };
-    draw_header(title, x + pad, y + 22.0);
+    // Tag the brain's dynamics — CTRNN carries persistent recurrent state
+    // (memory), feed-forward resets each tick — so the two competing types in a
+    // mixed run are legible on the inspected creature.
+    let kind_tag = match sel_view.map(|v| v.kind) {
+        Some(BrainKind::Ctrnn) => "  ·  ctrnn",
+        Some(BrainKind::Feedforward) => "  ·  feed-forward",
+        None => "",
+    };
+    draw_header(&format!("{base}{kind_tag}"), x + pad, y + 22.0);
 
     let (Some(v), Some(g)) = (sel_view, graph) else {
         draw_text("(no creature selected)", x + pad, y + 50.0, 15.0, MUTED);
@@ -1905,6 +1932,13 @@ fn draw_brain_graph(
             lerp(BASELINE.b, target.b, smag),
             0.10 + smag * 0.80,
         );
+        // A recurrent self-loop (an inner neuron feeding itself — the CTRNN memory
+        // latch) is a zero-length line; draw it as a small ring beside the node so
+        // the recurrence is visible.
+        if e.src_layer == e.sink_layer && e.src_id == e.sink_id {
+            draw_circle_lines(x0 + 6.0, y0 - 6.0, 4.5, 0.6 + wmag * 1.4, col);
+            continue;
+        }
         draw_line(x0, y0, x1, y1, thick, col);
     }
 

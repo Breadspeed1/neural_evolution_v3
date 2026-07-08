@@ -5,7 +5,7 @@ use clap::Parser;
 use hecs::Entity;
 use macroquad::prelude::*;
 use neural_evolution::agent::Connection;
-use neural_evolution::eco::{EcoMetrics, EcoSim, HerbView};
+use neural_evolution::eco::{CreatureView, EcoMetrics, EcoSim, Species};
 use neural_evolution::grid::Cell;
 use neural_evolution::{AgentView, Cli, Mode, Simulator, build_eco_sim, build_simulator};
 
@@ -76,6 +76,10 @@ const NUTRIENT_HUE: Color = Color::new(176.0 / 255.0, 138.0 / 255.0, 96.0 / 255.
 // Herbivore accent (a warm amber, distinct from the plant/soil greens & browns)
 // for the population sparkline and the creatures legend swatch.
 const HERB_HUE: Color = Color::new(232.0 / 255.0, 176.0 / 255.0, 64.0 / 255.0, 1.0);
+// Predator accent (a hot red-orange — the apex tier) for the predator population
+// sparkline, status, and legend swatch. Deliberately hotter than the amber herb
+// hue and the green plant hue so the three trophic levels read apart at a glance.
+const PRED_HUE: Color = Color::new(233.0 / 255.0, 96.0 / 255.0, 58.0 / 255.0, 1.0);
 
 const MARGIN: f32 = 14.0;
 /// How many recent positions each agent's motion trail retains.
@@ -492,8 +496,9 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
         clear_background(BG_PAGE);
         if display {
             let world_px = screen_height();
-            // One herbivore snapshot per frame; selection + drawing read from it.
-            let views = eco.herbivore_views();
+            // One creature snapshot per frame (both species); selection + drawing
+            // read from it.
+            let views = eco.creature_views();
             let top_lineage = eco.latest().and_then(|m| m.lineage_counts.first().map(|&(l, _)| l));
 
             // Resolve the selection: drop it if the protagonist died, then
@@ -504,22 +509,26 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
                 selected = None;
             }
             if selected.is_none() {
-                set_herb_selection(eco, best_herb(&views, top_lineage), &mut selected, &mut graph, &mut trail);
+                set_creature_selection(eco, best_herb(&views, top_lineage), &mut selected, &mut graph, &mut trail);
             }
 
-            // Click selects the nearest grazer; `b` reselects the heuristic best.
+            // Click selects the nearest creature (either species); `b` reselects
+            // the best grazer, `p` the fattest predator (to inspect a hunter).
             if is_mouse_button_pressed(MouseButton::Left) {
                 let (mx, my) = mouse_position();
                 let cell = world_px / eco.width().max(1) as f32;
                 if mx < world_px && my < world_px && cell > 0.0 {
                     let (cx, cy) = ((mx / cell) as i32, (my / cell) as i32);
-                    if let Some(e) = nearest_herb(&views, cx, cy, 5) {
-                        set_herb_selection(eco, Some(e), &mut selected, &mut graph, &mut trail);
+                    if let Some(e) = nearest_creature(&views, cx, cy, 5) {
+                        set_creature_selection(eco, Some(e), &mut selected, &mut graph, &mut trail);
                     }
                 }
             }
             if is_key_pressed(KeyCode::B) {
-                set_herb_selection(eco, best_herb(&views, top_lineage), &mut selected, &mut graph, &mut trail);
+                set_creature_selection(eco, best_herb(&views, top_lineage), &mut selected, &mut graph, &mut trail);
+            }
+            if is_key_pressed(KeyCode::P) {
+                set_creature_selection(eco, best_predator(&views), &mut selected, &mut graph, &mut trail);
             }
 
             // Track the protagonist's path (skip consecutive duplicates so a
@@ -557,8 +566,10 @@ async fn run_eco(eco: &mut EcoSim, ticks: u64) {
 
 /// Assign the eco selection and rebuild the (cached) signal-flow brain for it,
 /// resetting the protagonist's trail. The wiring is copied out of the ECS; the
-/// tighter [`HERB_MAX_EDGES`] cap keeps the herbivore circuit legible.
-fn set_herb_selection(
+/// tighter [`CREATURE_MAX_EDGES`] cap keeps the circuit legible. Works for either
+/// species — the brain panel picks the sensor-row labels from the selection's
+/// species at draw time.
+fn set_creature_selection(
     eco: &EcoSim,
     sel: Option<Entity>,
     selected: &mut Option<Entity>,
@@ -567,35 +578,49 @@ fn set_herb_selection(
 ) {
     *selected = sel;
     *graph = sel
-        .and_then(|e| eco.herb_connections(e))
-        .map(|c| BrainGraph::build_capped(&c, HERB_MAX_EDGES));
+        .and_then(|e| eco.creature_connections(e))
+        .map(|c| BrainGraph::build_capped(&c, CREATURE_MAX_EDGES));
     trail.clear();
 }
 
-/// The auto-selected protagonist: the highest-energy member of the current
+/// The auto-selected protagonist: the highest-energy **herbivore** of the current
 /// largest lineage (the reigning dynasty's fittest grazer), falling back to the
 /// globally fattest grazer before the first dynasty record exists. Selecting
 /// within the dominant bloodline ties the spotlight to the bloodlines strip — the
 /// ringed creature's hue matches the strip's widest band — and energy picks a
 /// thriving, long-lived individual, so the spotlight stays populated across ticks.
-fn best_herb(views: &[HerbView], top_lineage: Option<u32>) -> Option<Entity> {
-    let fattest = |pool: &mut dyn Iterator<Item = &HerbView>| {
+fn best_herb(views: &[CreatureView], top_lineage: Option<u32>) -> Option<Entity> {
+    let fattest = |pool: &mut dyn Iterator<Item = &CreatureView>| {
         pool.max_by(|a, b| {
             a.energy_frac.partial_cmp(&b.energy_frac).unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|v| v.entity)
     };
+    let herbs = |v: &&CreatureView| v.species == Species::Herbivore;
     if let Some(l) = top_lineage
-        && let Some(e) = fattest(&mut views.iter().filter(|v| v.lineage == l))
+        && let Some(e) = fattest(&mut views.iter().filter(herbs).filter(|v| v.lineage == l))
     {
         return Some(e);
     }
-    fattest(&mut views.iter())
+    fattest(&mut views.iter().filter(herbs))
 }
 
-/// Nearest grazer to cell (cx, cy) within `radius` cells (squared-Euclidean), if
-/// any — the click-to-select pick. Returns the stable entity, not an index.
-fn nearest_herb(views: &[HerbView], cx: i32, cy: i32, radius: i32) -> Option<Entity> {
+/// The fattest predator, for the `p` "inspect a hunter" pick. `None` if there are
+/// no predators (then the selection is left as-is).
+fn best_predator(views: &[CreatureView]) -> Option<Entity> {
+    views
+        .iter()
+        .filter(|v| v.species == Species::Predator)
+        .max_by(|a, b| {
+            a.energy_frac.partial_cmp(&b.energy_frac).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|v| v.entity)
+}
+
+/// Nearest creature (either species) to cell (cx, cy) within `radius` cells
+/// (squared-Euclidean), if any — the click-to-select pick. Returns the stable
+/// entity, not an index.
+fn nearest_creature(views: &[CreatureView], cx: i32, cy: i32, radius: i32) -> Option<Entity> {
     let mut best: Option<(i32, Entity)> = None;
     for v in views {
         let (ax, ay) = (v.pos.0 as i32, v.pos.1 as i32);
@@ -618,9 +643,9 @@ fn nearest_herb(views: &[HerbView], cx: i32, cy: i32, radius: i32) -> Option<Ent
 #[allow(clippy::too_many_arguments)]
 fn draw_eco_world(
     eco: &EcoSim,
-    views: &[HerbView],
+    views: &[CreatureView],
     spotlight: bool,
-    sel_view: Option<&HerbView>,
+    sel_view: Option<&CreatureView>,
     trail: &[(u32, u32)],
     world_px: f32,
     image: &mut Image,
@@ -649,37 +674,59 @@ fn draw_eco_world(
     let sel_entity = sel_view.map(|v| v.entity);
 
     if spotlight {
-        // Dim the whole crowd to a faint lineage-tinted wash — a quiet field the
-        // protagonist stands against. Small, low-alpha, no ring (also cheaper).
+        // Dim the whole crowd to a faint wash — a quiet field the protagonist
+        // stands against. Grazers are faint dots; predators stay faint warm
+        // chevrons (still legible as the rarer apex tier), skipping the selected.
         let r = (cell * 0.42).max(1.1);
-        for h in views {
-            if Some(h.entity) == sel_entity {
+        for c in views {
+            if Some(c.entity) == sel_entity {
                 continue;
             }
-            let (cx, cy) = center(h.pos);
-            let (cr, cg, cb) = hsl_to_rgb(lineage_hue(h.lineage), 0.55, 0.42);
-            draw_circle(cx, cy, r, Color::new(cr, cg, cb, 0.16));
+            let (cx, cy) = center(c.pos);
+            match c.species {
+                Species::Herbivore => {
+                    let (cr, cg, cb) = hsl_to_rgb(lineage_hue(c.lineage), 0.55, 0.42);
+                    draw_circle(cx, cy, r, Color::new(cr, cg, cb, 0.16));
+                }
+                Species::Predator => {
+                    let s = (cell * 0.7).max(2.0);
+                    draw_predator_mark(cx, cy, s, predator_color(c.lineage, c.energy_frac, 0.34), false);
+                }
+            }
         }
     } else {
-        // Calm baseline: the crowd as a living texture. Radius *and* brightness
-        // rise with energy (fat vs starving at a glance); a thin dark ring keeps
-        // lineage color legible over the green. Softer/smaller than the old
-        // ~2500-dot "confetti" — desaturated, lower alpha, and starving animals
-        // shrink to specks — so density reads as a breathing meadow, not sprinkles.
-        for h in views {
-            let (cx, cy) = center(h.pos);
-            let r = (cell * (0.24 + 0.32 * h.energy_frac)).max(1.2);
-            let (cr, cg, cb) = hsl_to_rgb(lineage_hue(h.lineage), 0.70, 0.38 + 0.26 * h.energy_frac);
+        // Calm baseline. Grazers first: a living texture whose radius *and*
+        // brightness rise with energy (fat vs starving at a glance), a thin dark
+        // ring keeping lineage color legible over the green — a breathing meadow.
+        for c in views.iter().filter(|c| c.species == Species::Herbivore) {
+            let (cx, cy) = center(c.pos);
+            let r = (cell * (0.24 + 0.32 * c.energy_frac)).max(1.2);
+            let (cr, cg, cb) = hsl_to_rgb(lineage_hue(c.lineage), 0.70, 0.38 + 0.26 * c.energy_frac);
             draw_circle(cx, cy, r + 0.4, Color::new(0.04, 0.05, 0.03, 0.42));
             draw_circle(cx, cy, r, Color::new(cr, cg, cb, 0.82));
         }
+        // Predators over the grazers: the apex tier, drawn as larger warm chevrons
+        // (a fang/arrowhead vs the grazers' dots) so a hunter is unmistakable at a
+        // glance. Size ∝ energy; a dark edge keeps them crisp over the meadow.
+        for c in views.iter().filter(|c| c.species == Species::Predator) {
+            let (cx, cy) = center(c.pos);
+            let s = (cell * (0.55 + 0.4 * c.energy_frac)).max(2.2);
+            draw_predator_mark(cx, cy, s, predator_color(c.lineage, c.energy_frac, 0.95), true);
+        }
     }
 
-    // The protagonist's comet tail: newer segments brighter and thicker. Reads
-    // strongest against the dimmed spotlight field, but drawn in both moods.
+    // The protagonist's comet tail: newer segments brighter and thicker. Warm for
+    // a predator, its lineage hue for a grazer. Reads strongest against the dimmed
+    // spotlight field, but drawn in both moods.
     if trail.len() >= 2 {
-        let hue = sel_view.map(|v| lineage_hue(v.lineage)).unwrap_or(0.12);
-        let (tr, tg, tb) = hsl_to_rgb(hue, 0.85, 0.62);
+        let (tr, tg, tb) = match sel_view {
+            Some(v) if v.species == Species::Predator => {
+                let c = predator_color(v.lineage, 1.0, 1.0);
+                (c.r, c.g, c.b)
+            }
+            Some(v) => hsl_to_rgb(lineage_hue(v.lineage), 0.85, 0.62),
+            None => hsl_to_rgb(0.12, 0.85, 0.62),
+        };
         let n = trail.len();
         for k in 1..n {
             let f = k as f32 / n as f32; // 0 (old) .. 1 (new)
@@ -689,17 +736,47 @@ fn draw_eco_world(
         }
     }
 
-    // The protagonist itself: full-bright body + a bright selection ring, so the
-    // one selected creature stands out whether or not the crowd is dimmed.
+    // The protagonist itself: full-bright body (species-shaped) + a bright
+    // selection ring, so the one selected creature stands out in either mood.
     if let Some(v) = sel_view {
         let (cx, cy) = center(v.pos);
-        let r = (cell * 0.62).max(2.2);
-        let (cr, cg, cb) = hsl_to_rgb(lineage_hue(v.lineage), 0.90, 0.42 + 0.26 * v.energy_frac);
-        draw_circle(cx, cy, r + 1.2, Color::new(0.02, 0.03, 0.02, 0.9));
-        draw_circle(cx, cy, r, Color::new(cr, cg, cb, 1.0));
+        match v.species {
+            Species::Herbivore => {
+                let r = (cell * 0.62).max(2.2);
+                let (cr, cg, cb) = hsl_to_rgb(lineage_hue(v.lineage), 0.90, 0.42 + 0.26 * v.energy_frac);
+                draw_circle(cx, cy, r + 1.2, Color::new(0.02, 0.03, 0.02, 0.9));
+                draw_circle(cx, cy, r, Color::new(cr, cg, cb, 1.0));
+            }
+            Species::Predator => {
+                let s = (cell * 0.95).max(3.2);
+                draw_predator_mark(cx, cy, s, predator_color(v.lineage, v.energy_frac, 1.0), true);
+            }
+        }
         let ring = (cell * 2.4).max(9.0);
         draw_circle_lines(cx, cy, ring, 2.0, Color::new(1.0, 1.0, 1.0, 0.95));
         draw_circle_lines(cx, cy, ring + 2.0, 1.0, Color::new(1.0, 1.0, 1.0, 0.32));
+    }
+}
+
+/// The warm apex palette for a predator: a red→orange band that reads as a
+/// clearly different, hotter species than the grazers' full-spectrum lineage
+/// hues, still lineage-varied (a small hue jitter) and energy-brightened.
+fn predator_color(lineage: u32, energy_frac: f32, alpha: f32) -> Color {
+    let hue = 0.015 + 0.055 * lineage_hue(lineage); // ~0.015..0.07 (red → orange)
+    let (r, g, b) = hsl_to_rgb(hue, 0.88, 0.42 + 0.20 * energy_frac);
+    Color::new(r, g, b, alpha)
+}
+
+/// Draw a predator's apex marker — an upward chevron (a fang/arrowhead) that
+/// reads as a distinct, larger species over the round grazer dots. `s` is the
+/// half-height; `outline` adds a dark edge so it stays legible over the meadow.
+fn draw_predator_mark(cx: f32, cy: f32, s: f32, col: Color, outline: bool) {
+    let tip = vec2(cx, cy - s);
+    let bl = vec2(cx - s * 0.92, cy + s * 0.70);
+    let br = vec2(cx + s * 0.92, cy + s * 0.70);
+    draw_triangle(tip, bl, br, col);
+    if outline {
+        draw_triangle_lines(tip, bl, br, 1.5, Color::new(0.06, 0.02, 0.02, 0.85));
     }
 }
 
@@ -723,7 +800,7 @@ fn eco_pixel(cell: &Cell, soil_cap: f32, biomass_max: f32) -> [u8; 4] {
 #[allow(clippy::too_many_arguments)]
 fn draw_eco_dashboard(
     eco: &EcoSim,
-    sel_view: Option<&HerbView>,
+    sel_view: Option<&CreatureView>,
     graph: Option<&BrainGraph>,
     spotlight: bool,
     world_px: f32,
@@ -745,20 +822,22 @@ fn draw_eco_dashboard(
     draw_text(&hud, world_px - dim.width - 12.0, 20.0, 15.0, MUTED);
 
     // Keybind strip pinned to the bottom (computed first so the panels above can
-    // fill the remaining height). `f` toggles spotlight, `b` reselects, click
-    // picks the nearest grazer.
-    let legend = "q/e speed  ·  f spotlight  ·  b best  ·  click select  ·  v display";
+    // fill the remaining height). `f` toggles spotlight, `b`/`p` reselect the best
+    // grazer / predator, click picks the nearest creature of either species.
+    let legend = "q/e speed · f spotlight · b grazer · p predator · click select · v display";
     let legend_h = 26.0;
     let legend_y = screen_height() - MARGIN - legend_h;
     draw_text(legend, col_x, legend_y + 17.0, 14.0, MUTED);
 
-    let status_h = 196.0;
+    let status_h = 214.0;
     draw_eco_status_panel(eco, col_x, y, col_w, status_h, target_sps, unlimited, display, spotlight);
     y += status_h + MARGIN;
 
-    // The predator-prey pulse: plant coverage, herbivore population (the pair),
-    // and total biomass.
-    let spark_h = 90.0;
+    // The tri-trophic readout: plant coverage, then the two mobile levels
+    // (herbivores in amber, predators in hot red) as the coupled pair whose lagged
+    // oscillation is the whole point, then total plant biomass. Four stacked
+    // sparklines = soil→plants→herbivores→predators at a glance.
+    let spark_h = 84.0;
     let coverage: Vec<f32> = eco.metrics_history().iter().map(|m| m.coverage as f32).collect();
     draw_sparkline(col_x, y, col_w, spark_h, &coverage, Some((0.0, 1.0)), "plant coverage", PLANT_HUE, true, "{:.0}%", 100.0);
     y += spark_h + MARGIN;
@@ -767,17 +846,21 @@ fn draw_eco_dashboard(
     draw_sparkline(col_x, y, col_w, spark_h, &population, None, "herbivores", HERB_HUE, true, "{:.0}", 1.0);
     y += spark_h + MARGIN;
 
+    let predators: Vec<f32> = eco.metrics_history().iter().map(|m| m.predators as f32).collect();
+    draw_sparkline(col_x, y, col_w, spark_h, &predators, None, "predators", PRED_HUE, true, "{:.0}", 1.0);
+    y += spark_h + MARGIN;
+
     let biomass: Vec<f32> = eco.metrics_history().iter().map(|m| m.total_biomass as f32).collect();
     draw_sparkline(col_x, y, col_w, spark_h, &biomass, None, "biomass", NUTRIENT_HUE, false, "{:.0}", 1.0);
     y += spark_h + MARGIN;
 
-    // Bloodlines strip: dynasty population share over time — the "watch evolution
-    // happen" panel (selective sweeps, blooms, crashes).
-    let dynasty_h = 150.0;
+    // Bloodlines strip: herbivore dynasty population share over time — the "watch
+    // evolution happen" panel (selective sweeps, blooms, crashes).
+    let dynasty_h = 130.0;
     draw_dynasty_strip(col_x, y, col_w, dynasty_h, eco.metrics_history());
     y += dynasty_h + MARGIN;
 
-    // The selected grazer's live signal-flow brain fills the rest of the column.
+    // The selected creature's live signal-flow brain fills the rest of the column.
     let brain_h = (legend_y - MARGIN - y).max(120.0);
     draw_eco_brain_panel(eco, col_x, y, col_w, brain_h, sel_view, graph);
 }
@@ -805,6 +888,10 @@ fn draw_eco_status_panel(
     let mean_energy = m.map(|m| m.mean_energy).unwrap_or(0.0);
     let births = m.map(|m| m.births).unwrap_or(0);
     let deaths = m.map(|m| m.deaths).unwrap_or(0);
+    let predators = m.map(|m| m.predators).unwrap_or(0);
+    let pred_energy = m.map(|m| m.pred_mean_energy).unwrap_or(0.0);
+    let pred_births = m.map(|m| m.pred_births).unwrap_or(0);
+    let pred_deaths = m.map(|m| m.pred_deaths).unwrap_or(0);
     let speed = if unlimited { "unlimited".to_string() } else { format!("{:.0}/s", target_sps) };
 
     let label_x = x + pad;
@@ -816,12 +903,13 @@ fn draw_eco_status_panel(
         draw_text(value, value_x, *ly, 17.0, vcol);
         *ly += row_h;
     };
-    row("mode", "eco  ·  terrarium (rung 2)", TEXT_SECONDARY, &mut ly);
+    row("mode", "eco  ·  terrarium (rung 3)", TEXT_SECONDARY, &mut ly);
     row("tick", &eco.tick_count().to_string(), TEXT_PRIMARY, &mut ly);
     row("plants", &format!("{:.1}% cover  ·  {biomass:.0} mass", coverage * 100.0), TEXT_SECONDARY, &mut ly);
-    row("herbivores", &population.to_string(), TEXT_PRIMARY, &mut ly);
-    row("mean energy", &format!("{mean_energy:.2}"), TEXT_SECONDARY, &mut ly);
-    row("flux", &format!("+{births} births  ·  -{deaths} deaths"), TEXT_SECONDARY, &mut ly);
+    row("herbivores", &format!("{population}  ·  mean-E {mean_energy:.2}"), TEXT_PRIMARY, &mut ly);
+    row("  flux", &format!("+{births} births  ·  -{deaths} deaths"), MUTED, &mut ly);
+    row("predators", &format!("{predators}  ·  mean-E {pred_energy:.2}"), PRED_HUE, &mut ly);
+    row("  flux", &format!("+{pred_births} births  ·  -{pred_deaths} deaths"), MUTED, &mut ly);
     row(
         "view",
         &format!("{speed}   display {}   spotlight {}", if display { "on" } else { "off" }, if spotlight { "on" } else { "off" }),
@@ -980,15 +1068,23 @@ fn draw_eco_brain_panel(
     y: f32,
     w: f32,
     h: f32,
-    sel_view: Option<&HerbView>,
+    sel_view: Option<&CreatureView>,
     graph: Option<&BrainGraph>,
 ) {
     draw_panel(x, y, w, h);
     let pad = MARGIN;
-    draw_header("brain - grazer", x + pad, y + 22.0);
+
+    // The header + sensor-row labels follow the selection's species: a grazer's
+    // forager sensorium or a predator's hunting sensorium.
+    let species = sel_view.map(|v| v.species);
+    let (title, labels): (&str, &[&str]) = match species {
+        Some(Species::Predator) => ("brain - predator", &PRED_INPUT_LABELS),
+        _ => ("brain - grazer", &HERB_INPUT_LABELS),
+    };
+    draw_header(title, x + pad, y + 22.0);
 
     let (Some(v), Some(g)) = (sel_view, graph) else {
-        draw_text("(no grazer selected)", x + pad, y + 50.0, 15.0, MUTED);
+        draw_text("(no creature selected)", x + pad, y + 50.0, 15.0, MUTED);
         return;
     };
 
@@ -1012,10 +1108,10 @@ fn draw_eco_brain_panel(
     if gh < 40.0 {
         return;
     }
-    let Some(neurons) = eco.herb_neurons(v.entity) else {
+    let Some(neurons) = eco.creature_neurons(v.entity) else {
         return;
     };
-    draw_brain_graph(gx, gy, gw, gh, g, &neurons, &HERB_INPUT_LABELS);
+    draw_brain_graph(gx, gy, gw, gh, g, &neurons, labels);
 }
 
 /// Append the current agent positions as the newest trail sample, capped to
@@ -1583,13 +1679,21 @@ const HERB_INPUT_LABELS: [&str; 12] = [
     "bias", "osc", "energy", "rand", "food", "grad-ns", "grad-ew", // 0..6
     "blk-N", "blk-S", "blk-E", "blk-W", "crowd", // 7..11
 ];
+/// Predator hunting sensorium labels, keyed to `eco::PRED_INPUTS` (12 inputs):
+/// bias, oscillator, own energy, random, prey-density-here, the two-axis prey
+/// direction (over the wide sensing radius), four directional blocked sensors,
+/// and own-species (pack) spacing.
+const PRED_INPUT_LABELS: [&str; 12] = [
+    "bias", "osc", "energy", "rand", "prey", "prey-ns", "prey-ew", // 0..6
+    "blk-N", "blk-S", "blk-E", "blk-W", "pack", // 7..11
+];
 const OUTPUT_LABELS: [&str; 5] = ["rand", "N", "S", "E", "W"];
 /// Cap on edges drawn in the challenge brain panel; above this we keep the
 /// top-|weight|.
 const MAX_EDGES: usize = 120;
-/// Tighter edge cap for the eco herbivore's signal-flow panel — the ~30
-/// strongest connections, so the live wiring reads as one legible circuit.
-const HERB_MAX_EDGES: usize = 30;
+/// Tighter edge cap for the eco creature signal-flow panel (grazer or predator) —
+/// the ~30 strongest connections, so the live wiring reads as one legible circuit.
+const CREATURE_MAX_EDGES: usize = 30;
 /// Live-signal magnitude (|source activation × weight|) that maps to a fully
 /// bright edge in the signal-flow inspector; stronger signals clamp here.
 const SIGNAL_FULL: f32 = 1.2;
@@ -1624,7 +1728,7 @@ impl BrainGraph {
     /// Prune to the subgraph that can influence an output (backward reachability
     /// from the output layer), then cap to the top `max_edges` by |weight|. Takes
     /// the connections copied out of the ECS (the viewer holds no borrow). The
-    /// eco herbivore panel passes a tighter [`HERB_MAX_EDGES`] cap.
+    /// eco creature panel passes a tighter [`CREATURE_MAX_EDGES`] cap.
     fn build_capped(conns: &[Connection], max_edges: usize) -> BrainGraph {
         // reaches: inner nodes with a path forward to an output. Fixpoint over
         // connections (sink type 2 = output is terminal-true).

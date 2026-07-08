@@ -215,6 +215,46 @@ fn apply_eco_env_overrides(p: &mut eco::EcoParams) {
     if std::env::var("ECO_RESEED").is_ok() {
         p.reseed_on_extinction = true;
     }
+    // Predator (rung 3) tuning overrides — same dev-only, binary-path-only
+    // discipline as the herbivore ones above, for sweeping the tri-trophic
+    // balance without a recompile.
+    let i32v = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<i32>().ok());
+    if let Some(v) = f32v("ECO_CATCH_EFF") {
+        p.catch_efficiency = v;
+    }
+    if let Some(v) = i32v("ECO_PRED_SENSE") {
+        p.pred_sense_radius = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_PREY_CAP") {
+        p.pred_prey_cap = v;
+    }
+    if let Some(v) = i32v("ECO_PRED_SPEED") {
+        p.pred_speed = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_METAB") {
+        p.pred_metabolism = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_MOVE_COST") {
+        p.pred_move_cost = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_REPRO") {
+        p.pred_repro_threshold = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_ENERGY_MAX") {
+        p.pred_energy_max = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_INIT_ENERGY") {
+        p.pred_init_energy = v;
+    }
+    if let Some(v) = f32v("ECO_PRED_CORPSE") {
+        p.pred_corpse_nutrient = v;
+    }
+    if let Some(v) = usizev("ECO_INIT_PRED") {
+        p.init_predators = v;
+    }
+    if std::env::var("ECO_PRED_RESEED").is_ok() {
+        p.reseed_predators_on_extinction = true;
+    }
 }
 
 /// Y coordinate an agent must exceed at generation end to survive and

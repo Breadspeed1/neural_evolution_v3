@@ -68,37 +68,43 @@ fn run_eco(cli: &Cli) {
         sim.width(),
         sim.height(),
     );
-    println!("   tick   coverage    biomass   nutrient    herb-pop   mean-E   births   deaths");
+    println!(
+        "   tick   coverage    biomass    herb-pop   herb-E    pred-pop   pred-E   pred-b   pred-d"
+    );
     let hist = sim.metrics_history();
     let last = hist.len().saturating_sub(1);
     // A spread of ticks spanning short-run transients through a long-run plateau,
-    // so the plant↔herbivore coupling (and any oscillation) is visible at a glance.
+    // so the full tri-trophic coupling (plants → herbivores → predators, and any
+    // lagged oscillation) is visible at a glance.
     let marks = [
         0usize, 50, 100, 200, 500, 1000, 2000, 3000, 5000, 7500, 10000, 12500, 15000, 17500, 20000,
-        25000, 30000, 40000, 50000,
+        25000, 30000, 40000, 50000, 60000, 75000, 100000,
     ];
     for &t in marks.iter().filter(|&&t| t <= last) {
         let m = &hist[t];
         println!(
-            "  {:>5}   {:>7.2}%   {:>8.1}   {:>7.3}   {:>9}   {:>6.2}   {:>6}   {:>6}",
+            "  {:>5}   {:>7.2}%   {:>8.1}   {:>9}   {:>6.2}   {:>9}   {:>6.2}   {:>6}   {:>6}",
             m.tick,
             m.coverage * 100.0,
             m.total_biomass,
-            m.mean_nutrient,
             m.population,
             m.mean_energy,
-            m.births,
-            m.deaths,
+            m.predators,
+            m.pred_mean_energy,
+            m.pred_births,
+            m.pred_deaths,
         );
     }
     if let Some(m) = hist.get(last) {
         println!(
-            "  final @ {}: coverage {:.2}%  biomass {:.1}  herbivores {}  mean-E {:.2}",
+            "  final @ {}: coverage {:.2}%  biomass {:.1}  herbivores {}  predators {}  (herb-E {:.2}  pred-E {:.2})",
             m.tick,
             m.coverage * 100.0,
             m.total_biomass,
             m.population,
+            m.predators,
             m.mean_energy,
+            m.pred_mean_energy,
         );
     }
 }

@@ -78,6 +78,43 @@ use crate::grid::{Cell, Grid};
 /// |  11 | density     | occupied fraction of the 8-neighborhood (herbivore crowding) |
 const HERB_INPUTS: usize = 12;
 
+/// Predator sensor layout — the *hunting* sensorium fed to the reused
+/// feed-forward [`Brain`] each tick (rung 3, the apex tier). Analogous to the
+/// herbivore's forager sensorium ([`HERB_INPUTS`]) but it senses **prey**
+/// (herbivores) instead of plant biomass, and over a **wider radius**
+/// ([`EcoParams::pred_sense_radius`]) — the scale separation that makes predators
+/// a distinct "birds swooping" scale of interaction rather than big herbivores.
+/// Width is [`PRED_INPUTS`]; the genome decodes source ids modulo this width, so
+/// a distinct count from the herbivore's 12 is fine. Outputs reuse the movement
+/// scheme (trigger + 4 dirs), applied up to [`EcoParams::pred_speed`] cells/tick.
+///
+/// |  id | sensor      | meaning                                                              |
+/// |----:|-------------|----------------------------------------------------------------------|
+/// |   0 | bias        | constant 1.0                                                         |
+/// |   1 | oscillator  | tick parity (0.0 / 1.0)                                              |
+/// |   2 | energy      | own energy / `pred_energy_max`, clamped 0..1 (satiation / hunger)   |
+/// |   3 | random      | fresh per-tick uniform 0..1 (exploration noise)                     |
+/// |   4 | prey_here   | prey density in the sensing window, clamped 0..1 (how much to hunt) |
+/// |   5 | prey_ns     | distance-weighted prey direction, N(+)/S(−), clamp −1..1            |
+/// |   6 | prey_ew     | distance-weighted prey direction, E(+)/W(−), clamp −1..1            |
+/// |   7 | blocked_n   | 1.0 if the +y neighbor is off-grid or occupied                     |
+/// |   8 | blocked_s   | 1.0 if the −y neighbor is off-grid or occupied                     |
+/// |   9 | blocked_e   | 1.0 if the +x neighbor is off-grid or occupied                     |
+/// |  10 | blocked_w   | 1.0 if the −x neighbor is off-grid or occupied                     |
+/// |  11 | pack        | own-species density in the 8-neighborhood (predator spacing)       |
+const PRED_INPUTS: usize = 12;
+
+/// Which trophic role a mobile creature plays. Herbivores graze plant biomass;
+/// predators hunt herbivores. Both are hecs entities sharing [`Position`], an
+/// energy budget, a feed-forward [`Brain`], and a [`Lineage`]-like id — the
+/// species tag is what the serial entity phase branches on (grazing vs hunting)
+/// and what the viewer draws distinctly (grazer dots vs apex chevrons).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Species {
+    Herbivore,
+    Predator,
+}
+
 /// How many distinct lineages the dynasty record keeps per interval (the top-N
 /// by current population); the remainder folds into an "other" bucket the viewer
 /// derives. Bounds the per-record size so the metrics history stays small and
@@ -85,37 +122,45 @@ const HERB_INPUTS: usize = 12;
 /// bloodlines strip while capturing the reigning dynasties.
 const TOP_LINEAGES: usize = 12;
 
-/// A herbivore: the first mobile trophic level and the project's first
-/// generation-less birth/death evolver. Bundled as one hecs component (mirroring
-/// the challenge sim's [`crate::agent::Agent`]) alongside a standalone
-/// [`Position`]; energy and lineage ride here because the serial entity phase
-/// touches them together with the brain, so splitting them buys no parallelism.
-pub(crate) struct Herbivore {
+/// A mobile creature — a herbivore (rung 2) or a predator (rung 3). Both share
+/// this one bundle: the only structural difference is the [`Species`] tag (which
+/// selects the sensorium + the graze-vs-hunt dynamics) and the brain's input
+/// width. Bundled as one hecs component (mirroring the challenge sim's
+/// [`crate::agent::Agent`]) alongside a standalone [`Position`]; energy and
+/// lineage ride here because the serial entity phase touches them together with
+/// the brain, so splitting them buys no parallelism.
+pub(crate) struct Creature {
+    /// Herbivore (grazes biomass) or predator (hunts herbivores).
+    species: Species,
     /// The connection-list genome; a mutated copy is passed to each child.
     genome: Vec<u32>,
     /// The decoded feed-forward brain (12 inputs → movement), rebuilt from the
     /// genome at construction so brain and genome always agree.
     brain: Brain,
-    /// Body energy. Grazing adds, metabolism/movement subtract; ≤0 ⇒ death,
-    /// ≥ `repro_threshold` ⇒ a mutated child (energy split in half).
+    /// Body energy. Feeding adds, metabolism/movement subtract; ≤0 ⇒ death,
+    /// ≥ the species' repro threshold ⇒ a mutated child (energy split in half).
     energy: f32,
     /// Dynasty id (founder index, inherited verbatim) — viewer coloring only.
+    /// Predator ids are offset by [`PRED_LINEAGE_BASE`] so the two species' hues
+    /// and dynasty tallies never collide.
     lineage: u32,
     /// Inner-neuron count the brain was built with (to build children the same).
     amt_inners: u8,
 }
 
-/// A read-only per-herbivore snapshot for the viewer, materialized in stable
+/// A read-only per-creature snapshot for the viewer, materialized in stable
 /// `order` sequence (keeps the render code off the ECS internals, like the
-/// challenge sim's `AgentView`).
-pub struct HerbView {
+/// challenge sim's `AgentView`). Carries the [`Species`] so the viewer can draw
+/// grazers and predators distinctly and pick the right brain-input labels.
+pub struct CreatureView {
     /// The hecs entity id — stable across ticks, so the viewer selects/tracks a
     /// protagonist by this (an `order` index shifts as neighbors die).
     pub entity: Entity,
     pub pos: (u32, u32),
     pub lineage: u32,
-    /// Energy as a 0..1 fraction of `energy_max` (drives brightness).
+    /// Energy as a 0..1 fraction of the species' `energy_max` (drives brightness).
     pub energy_frac: f32,
+    pub species: Species,
 }
 
 /// The tunable dynamics of the meadow. Kept as a struct (rather than bare
@@ -201,6 +246,51 @@ pub struct EcoParams {
     /// (a tuning-robustness aid; the coexistence gate is measured with it OFF).
     pub reseed_on_extinction: bool,
 
+    // --- predators (rung 3: the apex tier, a second evolving species) ---
+    /// Fraction of a caught herbivore's energy the predator assimilates (trophic
+    /// efficiency < 1 — the ~10% rule analogue). The uneaten remainder returns to
+    /// the soil as a corpse pulse. The main lever on how much a catch is "worth".
+    pub catch_efficiency: f32,
+    /// Radius (in cells, Chebyshev) over which a predator senses prey — **wider**
+    /// than a herbivore's single-cell biomass gradient. Half of the scale
+    /// separation that makes predators a distinct scale of interaction.
+    pub pred_sense_radius: i32,
+    /// Prey count in the sensing window that saturates the `prey_here` input to
+    /// 1.0 (so the density sensor stays in 0..1 over a useful range).
+    pub pred_prey_cap: f32,
+    /// Max cells a predator advances per tick along its chosen heading — **faster**
+    /// than a herbivore's one cell. The other half of the scale separation (birds
+    /// swooping). Movement is cell-by-cell, so walls/occupants still stop it.
+    pub pred_speed: i32,
+    /// Baseline energy a predator spends per tick just staying alive (its
+    /// starvation clock — higher than a herbivore's, an apex tier burns more).
+    pub pred_metabolism: f32,
+    /// Extra energy a predator spends per cell actually moved.
+    pub pred_move_cost: f32,
+    /// Energy at/above which a predator spawns a mutated child (splitting its
+    /// energy in half) onto an empty neighbor — the predator reproduction gate.
+    pub pred_repro_threshold: f32,
+    /// Satiation cap: a predator's energy never exceeds this. Large relative to
+    /// `pred_metabolism` gives predators a deep reserve buffer to ride out prey
+    /// lulls — the same mechanism that makes the herbivore layer robust.
+    pub pred_energy_max: f32,
+    /// Energy each founder / reseeded predator starts with.
+    pub pred_init_energy: f32,
+    /// Nutrient a predator's body deposits into its cell when it starves (body →
+    /// soil), closing the trophic loop for the apex tier too.
+    pub pred_corpse_nutrient: f32,
+    /// Inner-neuron count of each predator brain.
+    pub pred_inner_neurons: u8,
+    /// Gene (connection) count of each founder predator genome.
+    pub pred_genome_length: usize,
+    /// Per-bit mutation probability applied to a predator child's genome.
+    pub pred_mutation_rate: f32,
+    /// Number of founder predators scattered at initialization.
+    pub init_predators: usize,
+    /// If true, scatter a fresh founder predator cohort on predator extinction
+    /// (a tuning-robustness aid; the tri-trophic gate is measured with it OFF).
+    pub reseed_predators_on_extinction: bool,
+
     // --- metrics / init ---
     /// Biomass above which a cell counts as "vegetated" for the coverage metric.
     pub coverage_threshold: f32,
@@ -250,6 +340,34 @@ impl Default for EcoParams {
             herb_mutation_rate: 0.02,
             init_herbivores: 150,
             reseed_on_extinction: false,
+            // Predator economy (rung 3), tuned (seeds 42/7/123, 128², 25k–50k
+            // ticks) for persistent, self-sustaining tri-trophic coexistence. Two
+            // levers do the work: (1) a **moderate** sensing radius (4 — still
+            // wider than the herbivore's 1-cell gradient, the scale separation,
+            // but local enough that the hunt stays *spatially structured* rather
+            // than mean-field, so local prey troughs don't synchronize into a
+            // global predator crash); (2) a **deep** energy reserve
+            // (`pred_energy_max` 80 vs metabolism 0.045 ⇒ ~1800 ticks of famine
+            // buffer) so predators ride out prey lulls instead of starving out at
+            // the trough. Together they turn the classic predator-prey death
+            // spiral into a bounded, lagged oscillation. Catch efficiency 0.6 and
+            // a high repro threshold (42) keep predators from over-cropping the
+            // prey to extinction. See DESIGN.md for the trajectory + the reasoning.
+            catch_efficiency: 0.6,
+            pred_sense_radius: 4,
+            pred_prey_cap: 6.0,
+            pred_speed: 2,
+            pred_metabolism: 0.045,
+            pred_move_cost: 0.012,
+            pred_repro_threshold: 42.0,
+            pred_energy_max: 80.0,
+            pred_init_energy: 60.0,
+            pred_corpse_nutrient: 1.0,
+            pred_inner_neurons: 12,
+            pred_genome_length: 48,
+            pred_mutation_rate: 0.02,
+            init_predators: 26,
+            reseed_predators_on_extinction: false,
             coverage_threshold: 0.10,
             init_density: 0.01,
             init_biomass: 0.50,
@@ -286,6 +404,14 @@ pub struct EcoMetrics {
     pub deaths: u64,
     /// Mean herbivore energy (0.0 when the population is empty).
     pub mean_energy: f64,
+    /// Live predator count — the apex axis of the tri-trophic readout.
+    pub predators: u64,
+    /// Predator births since the previous recorded tick.
+    pub pred_births: u64,
+    /// Predator deaths since the previous recorded tick.
+    pub pred_deaths: u64,
+    /// Mean predator energy (0.0 when there are no predators).
+    pub pred_mean_energy: f64,
     /// The dynasty snapshot: the top-[`TOP_LINEAGES`] lineages by current
     /// population as `(lineage_id, count)` pairs, ordered by count descending
     /// (ties broken by ascending lineage id, so it is fully deterministic). The
@@ -304,21 +430,36 @@ fn cell_seed(master: u64, tick: u64, index: usize) -> u64 {
     crate::mix(s ^ index as u64)
 }
 
-/// Init tag mixed into the master seed for the founder scatter, kept distinct
-/// from any real tick used by `cell_seed` so the two RNG streams never alias.
+/// Init tag mixed into the master seed for the **herbivore** founder scatter,
+/// kept distinct from any real tick used by `cell_seed` so the two RNG streams
+/// never alias.
 const INIT_TAG: u64 = 0xEC05_EED0_0000_0001;
 
-/// Domain tag mixed into every herbivore RNG stream so a herbivore at index `k`
-/// on tick `t` never draws the same numbers as the *plant* cell at index `k`
-/// (whose stream is `cell_seed`) — the two subsystems stay decorrelated.
-const HERB_TAG: u64 = 0x4845_5242_1000_0001;
+/// Init tag for the **predator** founder scatter — distinct from [`INIT_TAG`] (and
+/// from any real tick) so the predator founder stream never aliases the herbivore
+/// founder stream. Keeping them separate is what makes herbivore founder placement
+/// (and thus a herbivore-only run) byte-identical whether or not predators exist.
+const PRED_INIT_TAG: u64 = 0xEC05_EED0_0000_0002;
 
-/// Per-herbivore RNG seed for the serial entity phase: the analogue of the
+/// Domain tag mixed into every creature RNG stream so a creature at index `k`
+/// on tick `t` never draws the same numbers as the *plant* cell at index `k`
+/// (whose stream is `cell_seed`) — the two subsystems stay decorrelated. Shared
+/// by both species: within a tick each creature keys off its unique position in
+/// the single `order`, so a herbivore and a predator never draw the same stream.
+const CREATURE_TAG: u64 = 0x4845_5242_1000_0001;
+
+/// Predator lineage ids are `PRED_LINEAGE_BASE + founder_index`, keeping them in
+/// a disjoint range from herbivore lineage ids (`0..init_herbivores`) so the two
+/// species' dynasty tallies and viewer hues never collide.
+const PRED_LINEAGE_BASE: u32 = 1_000_000;
+
+/// Per-creature RNG seed for the serial entity phase: the analogue of the
 /// generational sim's `agent_seed`, keyed by `(seed, tick, order-index)`. Index
-/// is the herbivore's position in the stable `order` at the tick's start, so the
-/// stream is reproducible regardless of how many draws each brain makes.
-fn herbivore_seed(master: u64, tick: u64, index: usize) -> u64 {
-    let s = crate::mix(master ^ HERB_TAG);
+/// is the creature's position in the stable `order` at the tick's start, so the
+/// stream is reproducible regardless of how many draws each brain makes, and
+/// herbivores and predators (distinct indices) never share a stream.
+fn creature_seed(master: u64, tick: u64, index: usize) -> u64 {
+    let s = crate::mix(master ^ CREATURE_TAG);
     let s = crate::mix(s ^ tick);
     crate::mix(s ^ index as u64)
 }
@@ -393,19 +534,24 @@ fn mature_neighbors(cells: &[Cell], width: usize, height: usize, i: usize, matur
 }
 
 /// The continuous producer-base simulation over a shared cell [`Grid`], now with
-/// a mobile herbivore layer (rung 2) living as hecs entities.
+/// two mobile trophic levels living as hecs entities: herbivores that graze
+/// (rung 2) and predators that hunt them (rung 3). Both share one stable `order`
+/// and one per-tick RNG scheme; the serial entity phase branches on [`Species`].
 pub struct EcoSim {
     grid: Grid,
     /// Double-buffer scratch: next tick's `(nutrient, biomass)` per cell.
     next: Vec<(f32, f32)>,
-    /// Herbivores live here as entities: a [`Position`] component + a
-    /// [`Herbivore`] bundle. hecs archetype iteration is not stable across
-    /// despawns, so every determinism-sensitive pass goes through `order`.
+    /// Creatures live here as entities: a [`Position`] component + a
+    /// [`Creature`] bundle (species-tagged). hecs archetype iteration is not
+    /// stable across despawns, so every determinism-sensitive pass goes through
+    /// `order`.
     ecs: hecs::World,
-    /// The stable birth-order of live herbivores — the determinism backbone,
-    /// mirroring the challenge sim. Position in `order` is the per-entity RNG
-    /// index: pushed on birth, `retain`-culled on death (survivors keep their
-    /// relative order), so an entity's index only ever decreases.
+    /// The stable birth-order of **all** live creatures, both species — the
+    /// determinism backbone, mirroring the challenge sim. Position in `order` is
+    /// the per-entity RNG index: pushed on birth, `retain`-culled on death
+    /// (survivors keep their relative order), so an entity's index only ever
+    /// decreases. Herbivores and predators share this one list; the entity phase
+    /// iterates it twice (grazers, then hunters), each keyed by order index.
     order: Vec<Entity>,
     tick: u64,
     config: EcoConfig,
@@ -416,9 +562,12 @@ pub struct EcoSim {
     /// determinism/headless runs; the viewer bumps it to bound memory.
     metrics_interval: u64,
     /// Births / deaths accumulated since the last recorded metrics tick (so the
-    /// counts are correct even when `metrics_interval > 1`).
+    /// counts are correct even when `metrics_interval > 1`). Herbivore counters;
+    /// predators have their own pair below.
     births_accum: u64,
     deaths_accum: u64,
+    pred_births_accum: u64,
+    pred_deaths_accum: u64,
 }
 
 impl EcoSim {
@@ -436,6 +585,8 @@ impl EcoSim {
             metrics_interval: 1,
             births_accum: 0,
             deaths_accum: 0,
+            pred_births_accum: 0,
+            pred_deaths_accum: 0,
         }
     }
 
@@ -471,12 +622,13 @@ impl EcoSim {
             cell.biomass = if rng.random::<f32>() < density { founder } else { 0.0 };
         }
         self.seed_herbivores();
+        self.seed_predators();
         self.record_metrics();
     }
 
     /// Scatter the founder herbivore cohort onto random empty cells, each with a
     /// fresh random genome (like the challenge sim's founders) and a founder
-    /// lineage id. Uses a dedicated `herbivore_seed`-derived stream so it never
+    /// lineage id. Uses a dedicated `creature_seed`-derived stream so it never
     /// aliases the plant founder scatter. A no-op when `init_herbivores == 0`
     /// (the pure producer-base regression tests rely on that).
     fn seed_herbivores(&mut self) {
@@ -485,7 +637,7 @@ impl EcoSim {
             return;
         }
         let (w, h) = (self.grid.width as u32, self.grid.height as u32);
-        let mut rng = ChaCha8Rng::seed_from_u64(herbivore_seed(self.config.seed, INIT_TAG, 0));
+        let mut rng = ChaCha8Rng::seed_from_u64(creature_seed(self.config.seed, INIT_TAG, 0));
         let mut placed = 0usize;
         // Bounded attempts so a near-full grid can't spin forever.
         let mut attempts = 0usize;
@@ -498,56 +650,100 @@ impl EcoSim {
             }
             let genome: Vec<u32> =
                 (0..p.herb_genome_length).map(|_| rng.random::<u32>()).collect();
-            let e = self.spawn_herbivore(
+            let e = self.spawn_creature(
                 pos,
                 genome,
                 p.herb_init_energy,
                 placed as u32,
                 p.herb_inner_neurons,
+                Species::Herbivore,
             );
             self.order.push(e);
             placed += 1;
         }
     }
 
-    /// Build a herbivore entity at `pos` (decoding its brain from the genome),
-    /// mark the cell occupied, and return the new entity. Does **not** append to
-    /// `order` — callers control ordering (founders push directly; births are
-    /// appended after the entity phase so they act next tick).
-    fn spawn_herbivore(
+    /// Scatter the founder predator cohort onto random empty cells, each with a
+    /// fresh random genome and a predator lineage id (offset by
+    /// [`PRED_LINEAGE_BASE`]). Uses a dedicated [`PRED_INIT_TAG`] stream so it
+    /// never aliases the herbivore founder scatter — keeping herbivore placement
+    /// (and a herbivore-only run) byte-identical. A no-op when `init_predators`
+    /// is 0 (the pure herbivore-layer regression tests rely on that).
+    fn seed_predators(&mut self) {
+        let p = self.config.params.clone();
+        if p.init_predators == 0 {
+            return;
+        }
+        let (w, h) = (self.grid.width as u32, self.grid.height as u32);
+        let mut rng = ChaCha8Rng::seed_from_u64(creature_seed(self.config.seed, PRED_INIT_TAG, 0));
+        let mut placed = 0usize;
+        let mut attempts = 0usize;
+        let max_attempts = p.init_predators.saturating_mul(200).max(10_000);
+        while placed < p.init_predators && attempts < max_attempts {
+            attempts += 1;
+            let pos = (rng.random_range(0..w), rng.random_range(0..h));
+            if self.grid.blocked(pos) {
+                continue;
+            }
+            let genome: Vec<u32> =
+                (0..p.pred_genome_length).map(|_| rng.random::<u32>()).collect();
+            let e = self.spawn_creature(
+                pos,
+                genome,
+                p.pred_init_energy,
+                PRED_LINEAGE_BASE + placed as u32,
+                p.pred_inner_neurons,
+                Species::Predator,
+            );
+            self.order.push(e);
+            placed += 1;
+        }
+    }
+
+    /// Build a creature entity at `pos` (decoding its brain from the genome at
+    /// the species' input width), mark the cell occupied, and return the new
+    /// entity. Does **not** append to `order` — callers control ordering (founders
+    /// push directly; births are appended after the entity phase so they act next
+    /// tick).
+    fn spawn_creature(
         &mut self,
         pos: (u32, u32),
         genome: Vec<u32>,
         energy: f32,
         lineage: u32,
         amt_inners: u8,
+        species: Species,
     ) -> Entity {
-        let brain = Brain::from(genome.clone(), HERB_INPUTS, amt_inners);
+        let num_inputs = match species {
+            Species::Herbivore => HERB_INPUTS,
+            Species::Predator => PRED_INPUTS,
+        };
+        let brain = Brain::from(genome.clone(), num_inputs, amt_inners);
         let e = self.ecs.spawn((
             Position { x: pos.0, y: pos.1 },
-            Herbivore { genome, brain, energy, lineage, amt_inners },
+            Creature { species, genome, brain, energy, lineage, amt_inners },
         ));
         self.grid.set_occupant(pos, e);
         e
     }
 
-    /// Read a herbivore's grid position (copied out, so no ECS borrow escapes).
+    /// Read a creature's grid position (copied out, so no ECS borrow escapes).
     #[inline]
-    fn herb_pos(&self, e: Entity) -> (u32, u32) {
-        let p = self.ecs.get::<&Position>(e).expect("herbivore has Position");
+    fn creature_pos(&self, e: Entity) -> (u32, u32) {
+        let p = self.ecs.get::<&Position>(e).expect("creature has Position");
         (p.x, p.y)
     }
 
-    /// Read a herbivore's current energy.
+    /// Read a creature's current energy.
     #[inline]
-    fn herb_energy(&self, e: Entity) -> f32 {
-        self.ecs.get::<&Herbivore>(e).expect("herbivore has Herbivore").energy
+    fn creature_energy(&self, e: Entity) -> f32 {
+        self.ecs.get::<&Creature>(e).expect("creature has Creature").energy
     }
 
-    /// Read a herbivore's lineage id.
+    /// Read a creature's species (which trophic role it plays).
     #[inline]
-    fn herb_lineage(&self, e: Entity) -> u32 {
-        self.ecs.get::<&Herbivore>(e).expect("herbivore has Herbivore").lineage
+    fn creature_species(&self, e: Entity) -> Species {
+        self.ecs.get::<&Creature>(e).expect("creature has Creature").species
     }
 
     /// Build the herbivore's sensor input vector at `pos` (see [`HERB_INPUTS`]
@@ -606,6 +802,100 @@ impl EcoSim {
         ]
     }
 
+    /// Build a predator's hunting sensor vector at `pos` (see [`PRED_INPUTS`] for
+    /// the layout). Prey are sensed from `prey_mask` (herbivore presence per cell)
+    /// over the **wide** `pred_sense_radius` — the scale separation; own-species
+    /// spacing from `pred_mask` (predator presence). A pure gather over the two
+    /// masks plus the grid's blocked flags, so it stays deterministic; `rand01` is
+    /// the pre-drawn random input from the entity's per-tick RNG.
+    fn sense_predator(
+        &self,
+        pos: (u32, u32),
+        energy: f32,
+        rand01: f32,
+        prey_mask: &[bool],
+        pred_mask: &[bool],
+    ) -> Vec<f32> {
+        let (w, h) = (self.grid.width as i32, self.grid.height as i32);
+        let p = &self.config.params;
+        let emax = p.pred_energy_max.max(1e-6);
+        let radius = p.pred_sense_radius.max(1);
+        let cells = &self.grid.cells;
+        let (x, y) = (pos.0 as i32, pos.1 as i32);
+
+        // Prey field over the wide sensing window: a count (→ `prey_here`) and a
+        // proximity-weighted direction (sign × 1/dist per prey → `prey_ns` /
+        // `prey_ew`), so nearer prey pull harder and a cluster reads as a heading.
+        let mut count = 0.0f32;
+        let mut vx = 0.0f32;
+        let mut vy = 0.0f32;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x + dx, y + dy);
+                if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                    continue;
+                }
+                if prey_mask[ny as usize * w as usize + nx as usize] {
+                    let dist = dx.abs().max(dy.abs()) as f32; // Chebyshev ≥ 1
+                    count += 1.0;
+                    vx += dx.signum() as f32 / dist;
+                    vy += dy.signum() as f32 / dist;
+                }
+            }
+        }
+        let prey_here = (count / p.pred_prey_cap.max(1e-6)).clamp(0.0, 1.0);
+        let prey_ns = vy.clamp(-1.0, 1.0);
+        let prey_ew = vx.clamp(-1.0, 1.0);
+
+        // "Blocked" for a neighbor: off-grid edges count as blocked, as does an
+        // obstacle or another creature standing there.
+        let blocked_at = |xx: i32, yy: i32| -> bool {
+            if xx < 0 || yy < 0 || xx >= w || yy >= h {
+                true
+            } else {
+                cells[yy as usize * w as usize + xx as usize].blocked()
+            }
+        };
+
+        // Own-species spacing: predator neighbors in the 8-neighborhood.
+        let mut pack = 0.0f32;
+        for dy in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                let (nx, ny) = (x + dx, y + dy);
+                if nx >= 0
+                    && ny >= 0
+                    && nx < w
+                    && ny < h
+                    && pred_mask[ny as usize * w as usize + nx as usize]
+                {
+                    pack += 1.0;
+                }
+            }
+        }
+
+        let b = |cond: bool| if cond { 1.0 } else { 0.0 };
+        vec![
+            1.0,
+            (self.tick % 2) as f32,
+            (energy / emax).clamp(0.0, 1.0),
+            rand01,
+            prey_here,
+            prey_ns,
+            prey_ew,
+            b(blocked_at(x, y + 1)),
+            b(blocked_at(x, y - 1)),
+            b(blocked_at(x + 1, y)),
+            b(blocked_at(x - 1, y)),
+            pack / 8.0,
+        ]
+    }
+
     /// Pick a random empty (unblocked, on-grid) cell from the 8-neighborhood of
     /// `pos`, drawing from `rng` (deterministic). `None` if the herbivore is
     /// boxed in — reproduction is then skipped this tick.
@@ -634,35 +924,57 @@ impl EcoSim {
         }
     }
 
-    /// The serial, order-stable entity phase (rung 2). For each live herbivore in
-    /// birth order: sense → brain → move (costs energy, blocked by the grid) →
-    /// graze the current cell (biomass → energy, up to `graze_cap` and the
-    /// satiation headroom) → pay metabolism → then die (deposit a corpse nutrient
-    /// pulse) or reproduce (spawn a mutated child on an empty neighbor, splitting
-    /// energy). Runs *after* the parallel field update, single-threaded, so it
-    /// never races the CA and every RNG draw is reproducible.
-    fn herbivore_phase(&mut self) {
+    /// The serial, order-stable entity phase (rungs 2 + 3). Runs *after* the
+    /// parallel field update, single-threaded, so it never races the CA and every
+    /// RNG draw is reproducible. It iterates the single stable `order` **twice**
+    /// over a fixed prefix `0..n` (children appended this tick act next tick):
+    ///
+    /// - **Sub-phase A — herbivores** (grazers): sense biomass → brain → move
+    ///   (one cell, costs energy) → graze → metabolism → die (corpse → soil) or
+    ///   reproduce. Byte-identical to the rung-2 logic (a herbivore at order index
+    ///   `idx` still keys off `creature_seed(seed, tick, idx)`), so a herbivore-only
+    ///   run is unchanged whether or not predators exist.
+    /// - **Sub-phase B — predators** (hunters): sense prey over the wide radius →
+    ///   brain → move **up to `pred_speed` cells** → **catch** an adjacent
+    ///   herbivore (prey dies, predator gains `catch_efficiency` × prey energy) →
+    ///   metabolism → die (corpse → soil) or reproduce.
+    ///
+    /// Running herbivores first means predators sense/hunt the meadow's *settled*
+    /// prey positions this tick, and a caught prey has already taken its turn, so
+    /// removing it never skips or double-processes a creature. All deaths (starved
+    /// grazers, starved predators, caught prey) are collected and applied once at
+    /// the end via an order-stable `retain`, never invalidating a live index
+    /// mid-phase — the same discipline as rung-2 starvation.
+    fn entity_phase(&mut self) {
         let p = self.config.params.clone();
         let (seed, tick) = (self.config.seed, self.tick);
         let w = self.grid.width;
         let (max_x, max_y) = (self.grid.max_x(), self.grid.max_y());
 
-        // Iterate a fixed prefix: children appended this tick (index ≥ n) act
-        // next tick, and `order` is not mutated until after the loop, so
-        // `self.order[idx]` and the RNG index `idx` are stable throughout.
+        // Fixed prefix over the tick's starting population; `order` is not mutated
+        // until after both sub-phases, so `self.order[idx]` and the RNG index
+        // `idx` are stable throughout. `dead_set` also guards the cross-species
+        // resolution (a predator can't catch an already-dead prey).
         let n = self.order.len();
         let mut dead: Vec<Entity> = Vec::new();
+        let mut dead_set: HashSet<Entity> = HashSet::new();
         let mut births: Vec<Entity> = Vec::new();
+        let (mut herb_births, mut pred_births) = (0u64, 0u64);
+        let (mut herb_deaths, mut pred_deaths) = (0u64, 0u64);
 
+        // ---- Sub-phase A: herbivores (grazing), rung-2 logic verbatim ----
         for idx in 0..n {
             let e = self.order[idx];
-            let pos = self.herb_pos(e);
-            let mut rng = ChaCha8Rng::seed_from_u64(herbivore_seed(seed, tick, idx));
+            if self.creature_species(e) != Species::Herbivore {
+                continue;
+            }
+            let pos = self.creature_pos(e);
+            let mut rng = ChaCha8Rng::seed_from_u64(creature_seed(seed, tick, idx));
             let rand01 = rng.random::<f32>();
-            let inputs = self.sense(pos, self.herb_energy(e), rand01);
+            let inputs = self.sense(pos, self.creature_energy(e), rand01);
             // Brain step in a scoped mutable borrow (dropped before any spawn).
             let translation = {
-                let mut hb = self.ecs.get::<&mut Herbivore>(e).expect("herbivore exists");
+                let mut hb = self.ecs.get::<&mut Creature>(e).expect("herbivore exists");
                 hb.brain.step(inputs, &mut rng)
             };
 
@@ -671,7 +983,7 @@ impl EcoSim {
                 (pos.0 as i32 + translation.0).clamp(0, max_x) as u32,
                 (pos.1 as i32 + translation.1).clamp(0, max_y) as u32,
             );
-            let mut energy = self.herb_energy(e);
+            let mut energy = self.creature_energy(e);
             let mut cur = pos;
             if target != pos && !self.grid.blocked(target) {
                 self.grid.clear_occupant(pos);
@@ -706,6 +1018,8 @@ impl EcoSim {
                 self.grid.clear_occupant(cur);
                 self.grid.cells[ci].nutrient += p.corpse_nutrient + energy.max(0.0);
                 dead.push(e);
+                dead_set.insert(e);
+                herb_deaths += 1;
                 continue;
             }
 
@@ -716,17 +1030,168 @@ impl EcoSim {
                 let child_energy = energy * 0.5;
                 energy -= child_energy;
                 let (pgenome, lineage, amt) = {
-                    let hb = self.ecs.get::<&Herbivore>(e).expect("parent exists");
+                    let hb = self.ecs.get::<&Creature>(e).expect("parent exists");
                     (hb.genome.clone(), hb.lineage, hb.amt_inners)
                 };
                 let child_genome = mutate_genome(&pgenome, p.herb_mutation_rate, &mut rng);
-                let child = self.spawn_herbivore(child_cell, child_genome, child_energy, lineage, amt);
+                let child = self.spawn_creature(
+                    child_cell,
+                    child_genome,
+                    child_energy,
+                    lineage,
+                    amt,
+                    Species::Herbivore,
+                );
                 births.push(child);
+                herb_births += 1;
             }
 
             // Commit the (surviving) parent's energy, clamped to the satiation cap.
-            let mut hb = self.ecs.get::<&mut Herbivore>(e).expect("herbivore exists");
+            let mut hb = self.ecs.get::<&mut Creature>(e).expect("herbivore exists");
             hb.energy = energy.min(p.energy_max);
+        }
+
+        // ---- Prey / predator presence masks, from this tick's settled positions
+        // (survivors of sub-phase A plus its newborns). Cheap array lookups drive
+        // the predators' wide-radius sensing; a snapshot for the whole sub-phase,
+        // so multiple predators sense a consistent field. Catching still reads
+        // live grid occupancy, so the snapshot never causes a phantom kill.
+        let mut prey_mask = vec![false; w * self.grid.height];
+        let mut pred_mask = vec![false; w * self.grid.height];
+        let mut mark = |this: &EcoSim, e: Entity| {
+            let pos = this.creature_pos(e);
+            let i = pos.1 as usize * w + pos.0 as usize;
+            match this.creature_species(e) {
+                Species::Herbivore => prey_mask[i] = true,
+                Species::Predator => pred_mask[i] = true,
+            }
+        };
+        for idx in 0..n {
+            let e = self.order[idx];
+            if !dead_set.contains(&e) {
+                mark(self, e);
+            }
+        }
+        for &e in &births {
+            mark(self, e); // sub-phase A newborns are all herbivores
+        }
+
+        // ---- Sub-phase B: predators (hunting) ----
+        for idx in 0..n {
+            let e = self.order[idx];
+            if self.creature_species(e) != Species::Predator || dead_set.contains(&e) {
+                continue;
+            }
+            let pos = self.creature_pos(e);
+            let mut rng = ChaCha8Rng::seed_from_u64(creature_seed(seed, tick, idx));
+            let rand01 = rng.random::<f32>();
+            let inputs = self.sense_predator(pos, self.creature_energy(e), rand01, &prey_mask, &pred_mask);
+            let translation = {
+                let mut pd = self.ecs.get::<&mut Creature>(e).expect("predator exists");
+                pd.brain.step(inputs, &mut rng)
+            };
+
+            // --- movement: up to `pred_speed` cells along the heading (the scale
+            // separation), cell-by-cell so walls/occupants still stop it ---
+            let (dx, dy) = translation;
+            let mut energy = self.creature_energy(e);
+            let mut cur = pos;
+            if dx != 0 || dy != 0 {
+                for _ in 0..p.pred_speed.max(1) {
+                    let target = (
+                        (cur.0 as i32 + dx).clamp(0, max_x) as u32,
+                        (cur.1 as i32 + dy).clamp(0, max_y) as u32,
+                    );
+                    if target == cur || self.grid.blocked(target) {
+                        break;
+                    }
+                    self.grid.clear_occupant(cur);
+                    self.grid.set_occupant(target, e);
+                    {
+                        let mut pc =
+                            self.ecs.get::<&mut Position>(e).expect("predator has Position");
+                        pc.x = target.0;
+                        pc.y = target.1;
+                    }
+                    cur = target;
+                    energy -= p.pred_move_cost;
+                }
+            }
+
+            // --- catch: the first live herbivore in the 8-neighborhood (fixed
+            // scan order → deterministic). Prey dies; the predator assimilates
+            // `catch_efficiency` of its energy, the uneaten remainder → soil.
+            // Reads live grid occupancy + `dead_set`, so no prey is caught twice.
+            let mut caught: Option<(Entity, (u32, u32))> = None;
+            'scan: for ddy in -1..=1i32 {
+                for ddx in -1..=1i32 {
+                    if ddx == 0 && ddy == 0 {
+                        continue;
+                    }
+                    let (nx, ny) = (cur.0 as i32 + ddx, cur.1 as i32 + ddy);
+                    if nx < 0 || ny < 0 || nx > max_x || ny > max_y {
+                        continue;
+                    }
+                    let ci = ny as usize * w + nx as usize;
+                    if let Some(occ) = self.grid.cells[ci].occupant
+                        && !dead_set.contains(&occ)
+                        && self.creature_species(occ) == Species::Herbivore
+                    {
+                        caught = Some((occ, (nx as u32, ny as u32)));
+                        break 'scan;
+                    }
+                }
+            }
+            if let Some((prey, ppos)) = caught {
+                let prey_energy = self.creature_energy(prey);
+                energy += (prey_energy * p.catch_efficiency).max(0.0);
+                let pci = ppos.1 as usize * w + ppos.0 as usize;
+                self.grid.clear_occupant(ppos);
+                self.grid.cells[pci].nutrient += p.corpse_nutrient * (1.0 - p.catch_efficiency).max(0.0);
+                dead.push(prey);
+                dead_set.insert(prey);
+                herb_deaths += 1;
+            }
+
+            // --- metabolism (the apex starvation clock) ---
+            energy -= p.pred_metabolism;
+
+            // --- death: despawn + return the body to the soil ---
+            if energy <= 0.0 {
+                let ci = cur.1 as usize * w + cur.0 as usize;
+                self.grid.clear_occupant(cur);
+                self.grid.cells[ci].nutrient += p.pred_corpse_nutrient + energy.max(0.0);
+                dead.push(e);
+                dead_set.insert(e);
+                pred_deaths += 1;
+                continue;
+            }
+
+            // --- reproduction: split energy onto a mutated child, if room ---
+            if energy >= p.pred_repro_threshold
+                && let Some(child_cell) = self.empty_neighbor(cur, &mut rng)
+            {
+                let child_energy = energy * 0.5;
+                energy -= child_energy;
+                let (pgenome, lineage, amt) = {
+                    let pd = self.ecs.get::<&Creature>(e).expect("parent exists");
+                    (pd.genome.clone(), pd.lineage, pd.amt_inners)
+                };
+                let child_genome = mutate_genome(&pgenome, p.pred_mutation_rate, &mut rng);
+                let child = self.spawn_creature(
+                    child_cell,
+                    child_genome,
+                    child_energy,
+                    lineage,
+                    amt,
+                    Species::Predator,
+                );
+                births.push(child);
+                pred_births += 1;
+            }
+
+            let mut pd = self.ecs.get::<&mut Creature>(e).expect("predator exists");
+            pd.energy = energy.min(p.pred_energy_max);
         }
 
         // Apply deaths (despawn + drop from `order`, preserving survivor order).
@@ -734,20 +1199,34 @@ impl EcoSim {
             for &e in &dead {
                 let _ = self.ecs.despawn(e);
             }
-            let dset: HashSet<Entity> = dead.iter().copied().collect();
-            self.order.retain(|e| !dset.contains(e));
+            self.order.retain(|e| !dead_set.contains(e));
         }
-        // Append this tick's newborns in birth (parent-processing) order.
-        self.order.extend(&births);
+        // Append this tick's newborns in (sub-phase, parent) processing order,
+        // skipping any that were already eaten this tick — a herbivore born in
+        // sub-phase A can be caught by a predator in sub-phase B before it ever
+        // joins `order`, in which case it was despawned above and must not be
+        // re-added (it counts as both a birth and a death for the tick's flux).
+        self.order.extend(births.iter().copied().filter(|e| !dead_set.contains(e)));
 
-        self.births_accum += births.len() as u64;
-        self.deaths_accum += dead.len() as u64;
+        self.births_accum += herb_births;
+        self.deaths_accum += herb_deaths;
+        self.pred_births_accum += pred_births;
+        self.pred_deaths_accum += pred_deaths;
 
-        // Optional robustness aid (off for the coexistence gate): if the
-        // herbivores died out, scatter a fresh founder cohort.
-        if self.order.is_empty() && p.reseed_on_extinction {
+        // Optional robustness aids (off for the coexistence gate): reseed a
+        // species' founder cohort if it went extinct this tick.
+        if p.reseed_on_extinction && !self.any_of_species(Species::Herbivore) {
             self.seed_herbivores();
         }
+        if p.reseed_predators_on_extinction && !self.any_of_species(Species::Predator) {
+            self.seed_predators();
+        }
+    }
+
+    /// Whether any live creature of `species` remains in `order` (for the
+    /// per-species extinction-reseed checks).
+    fn any_of_species(&self, species: Species) -> bool {
+        self.order.iter().any(|&e| self.creature_species(e) == species)
     }
 
     /// Advance the meadow one tick: diffuse nutrient, then react (replenish,
@@ -833,10 +1312,11 @@ impl EcoSim {
             cell.biomass = b;
         }
 
-        // Phase 3: the serial, order-stable herbivore entity phase. Runs on the
-        // freshly-grown meadow, mutating biomass (grazing), nutrient (corpses),
-        // and occupancy — never concurrently with the parallel CA above.
-        self.herbivore_phase();
+        // Phase 3: the serial, order-stable entity phase (herbivores graze, then
+        // predators hunt). Runs on the freshly-grown meadow, mutating biomass
+        // (grazing), nutrient (corpses), and occupancy — never concurrently with
+        // the parallel CA above.
+        self.entity_phase();
 
         self.tick += 1;
         if self.tick.is_multiple_of(self.metrics_interval) {
@@ -865,20 +1345,40 @@ impl EcoSim {
         }
         let denom = soil.max(1) as f64;
 
-        // Herbivore aggregates, summed serially over `order` so the f64 total is
-        // order-deterministic (byte-identical across same-seed runs).
-        let population = self.order.len() as u64;
-        let total_energy: f64 = self.order.iter().map(|&e| self.herb_energy(e) as f64).sum();
-        let mean_energy = if population > 0 { total_energy / population as f64 } else { 0.0 };
-
-        // Dynasty snapshot: count live herbivores per lineage, keep the top-N by
-        // count. A BTreeMap tally + a total-order sort make it order-independent
-        // and byte-identical across same-seed runs (the determinism gate). The
-        // remainder folds into "other" at display time.
+        // Herbivore + predator aggregates, summed serially over `order` (split by
+        // species) so the f64 totals are order-deterministic (byte-identical
+        // across same-seed runs). Only herbivores feed the `population`/
+        // `mean_energy` prey metrics and the dynasty tally; predators get their
+        // own count + mean energy. Iterating `order` in one pass keeps the
+        // herbivore energy sum in the exact same order as the rung-2 code, so a
+        // herbivore-only run stays byte-identical.
+        let mut population = 0u64;
+        let mut total_energy = 0.0f64;
+        let mut predators = 0u64;
+        let mut pred_total_energy = 0.0f64;
         let mut tally: BTreeMap<u32, u32> = BTreeMap::new();
         for &e in &self.order {
-            *tally.entry(self.herb_lineage(e)).or_insert(0) += 1;
+            let c = self.ecs.get::<&Creature>(e).expect("live creature");
+            match c.species {
+                Species::Herbivore => {
+                    population += 1;
+                    total_energy += c.energy as f64;
+                    *tally.entry(c.lineage).or_insert(0) += 1;
+                }
+                Species::Predator => {
+                    predators += 1;
+                    pred_total_energy += c.energy as f64;
+                }
+            }
         }
+        let mean_energy = if population > 0 { total_energy / population as f64 } else { 0.0 };
+        let pred_mean_energy =
+            if predators > 0 { pred_total_energy / predators as f64 } else { 0.0 };
+
+        // Dynasty snapshot: the top-N herbivore lineages by count. A BTreeMap tally
+        // + a total-order sort make it order-independent and byte-identical across
+        // same-seed runs (the determinism gate). The remainder folds into "other"
+        // at display time.
         let mut lineage_counts: Vec<(u32, u32)> = tally.into_iter().collect();
         lineage_counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         lineage_counts.truncate(TOP_LINEAGES);
@@ -892,12 +1392,18 @@ impl EcoSim {
             births: self.births_accum,
             deaths: self.deaths_accum,
             mean_energy,
+            predators,
+            pred_births: self.pred_births_accum,
+            pred_deaths: self.pred_deaths_accum,
+            pred_mean_energy,
             lineage_counts,
         };
         // Births/deaths are reported per recording interval, so reset the running
         // counters once folded into a record.
         self.births_accum = 0;
         self.deaths_accum = 0;
+        self.pred_births_accum = 0;
+        self.pred_deaths_accum = 0;
         if let Some(file) = self.metrics_out.as_mut()
             && let Ok(line) = serde_json::to_string(&m)
         {
@@ -933,39 +1439,63 @@ impl EcoSim {
         &self.grid.cells
     }
 
-    /// Live herbivore count (the prey axis of the predator-prey readout).
+    /// Live herbivore count (the prey axis of the tri-trophic readout).
     pub fn population(&self) -> usize {
-        self.order.len()
+        self.order.iter().filter(|&&e| self.creature_species(e) == Species::Herbivore).count()
     }
 
-    /// A render snapshot (position + lineage + energy fraction) per herbivore, in
-    /// stable `order` sequence — the viewer draws creatures from this without
-    /// touching the ECS.
-    pub fn herbivore_views(&self) -> Vec<HerbView> {
-        let emax = self.config.params.energy_max.max(1e-6);
+    /// Live predator count (the apex axis of the tri-trophic readout).
+    pub fn predator_population(&self) -> usize {
+        self.order.iter().filter(|&&e| self.creature_species(e) == Species::Predator).count()
+    }
+
+    /// A render snapshot (position + lineage + energy fraction + species) per
+    /// creature — both species — in stable `order` sequence. The viewer draws
+    /// grazers and predators from this without touching the ECS, branching on
+    /// `species`. Energy is normalized by the creature's own species cap.
+    pub fn creature_views(&self) -> Vec<CreatureView> {
+        let p = &self.config.params;
+        let (herb_max, pred_max) = (p.energy_max.max(1e-6), p.pred_energy_max.max(1e-6));
         self.order
             .iter()
             .map(|&e| {
-                let pos = self.herb_pos(e);
-                let hb = self.ecs.get::<&Herbivore>(e).expect("herbivore exists");
-                HerbView { entity: e, pos, lineage: hb.lineage, energy_frac: (hb.energy / emax).clamp(0.0, 1.0) }
+                let pos = self.creature_pos(e);
+                let c = self.ecs.get::<&Creature>(e).expect("creature exists");
+                let emax = match c.species {
+                    Species::Herbivore => herb_max,
+                    Species::Predator => pred_max,
+                };
+                CreatureView {
+                    entity: e,
+                    pos,
+                    lineage: c.lineage,
+                    energy_frac: (c.energy / emax).clamp(0.0, 1.0),
+                    species: c.species,
+                }
             })
             .collect()
     }
 
-    /// The brain wiring of one herbivore (for the inspector's signal-flow
-    /// diagram), copied out so the viewer holds no ECS borrow. `None` if the
-    /// entity has despawned. Read only on (re)selection, so the clone is cheap.
-    pub fn herb_connections(&self, e: Entity) -> Option<Vec<Connection>> {
-        self.ecs.get::<&Herbivore>(e).ok().map(|hb| hb.brain.connections().to_vec())
+    /// The brain wiring of one creature (for the inspector's signal-flow diagram),
+    /// copied out so the viewer holds no ECS borrow. `None` if the entity has
+    /// despawned. Read only on (re)selection, so the clone is cheap. Species-
+    /// agnostic — works for a grazer or a predator alike.
+    pub fn creature_connections(&self, e: Entity) -> Option<Vec<Connection>> {
+        self.ecs.get::<&Creature>(e).ok().map(|c| c.brain.connections().to_vec())
     }
 
-    /// The live neuron activations of one herbivore, indexed `[layer][id]`
-    /// (0 = the 12 forager inputs, 1 = inner, 2 = the 5 movement outputs),
-    /// copied out so the viewer holds no ECS borrow. Read every frame for the
-    /// spotlighted creature; `None` if it despawned.
-    pub fn herb_neurons(&self, e: Entity) -> Option<Vec<Vec<f32>>> {
-        self.ecs.get::<&Herbivore>(e).ok().map(|hb| hb.brain.neurons().to_vec())
+    /// The live neuron activations of one creature, indexed `[layer][id]`
+    /// (0 = the 12 sensor inputs, 1 = inner, 2 = the 5 movement outputs), copied
+    /// out so the viewer holds no ECS borrow. Read every frame for the spotlighted
+    /// creature; `None` if it despawned.
+    pub fn creature_neurons(&self, e: Entity) -> Option<Vec<Vec<f32>>> {
+        self.ecs.get::<&Creature>(e).ok().map(|c| c.brain.neurons().to_vec())
+    }
+
+    /// The species of one live creature (so the viewer can label the brain panel
+    /// and pick the right sensor-row labels). `None` if it despawned.
+    pub fn species_of(&self, e: Entity) -> Option<Species> {
+        self.ecs.get::<&Creature>(e).ok().map(|c| c.species)
     }
 
     /// Every recorded tick's metrics (drives the viewer's biomass/coverage
@@ -1012,7 +1542,17 @@ impl EcoSim {
         lineage: u32,
     ) -> Entity {
         let amt = self.config.params.herb_inner_neurons;
-        let e = self.spawn_herbivore((x, y), genome, energy, lineage, amt);
+        let e = self.spawn_creature((x, y), genome, energy, lineage, amt, Species::Herbivore);
+        self.order.push(e);
+        e
+    }
+
+    /// Spawn one predator at `(x, y)` with an explicit genome + energy and append
+    /// it to `order`. Test-only escape hatch for the rung-3 hunting/energy tests.
+    #[cfg(test)]
+    fn test_spawn_predator(&mut self, x: u32, y: u32, genome: Vec<u32>, energy: f32) -> Entity {
+        let amt = self.config.params.pred_inner_neurons;
+        let e = self.spawn_creature((x, y), genome, energy, PRED_LINEAGE_BASE, amt, Species::Predator);
         self.order.push(e);
         e
     }
@@ -1040,7 +1580,8 @@ mod tests {
         p.decay = 0.0;
         p.mortality = 0.0;
         p.seed_rate = 0.0;
-        p.init_herbivores = 0; // only manually-placed herbivores in these tests
+        p.init_herbivores = 0; // only manually-placed creatures in these tests
+        p.init_predators = 0;
     }
 
     #[test]
@@ -1173,6 +1714,7 @@ mod tests {
         // on rung 1's self-regulation independent of the grazing layer.
         let mut c = cfg(42, 96, 96);
         c.params.init_herbivores = 0;
+        c.params.init_predators = 0;
         let mut sim = EcoSim::new(c);
         sim.seed_initial();
         for _ in 0..3000 {
@@ -1206,7 +1748,7 @@ mod tests {
         sim.tick();
         let (_, b1) = sim.cell_at(4, 4);
         assert!((b1 - 0.20).abs() < 1e-4, "grazing should remove 0.10 biomass: -> {b1}");
-        let en = sim.herb_energy(e);
+        let en = sim.creature_energy(e);
         assert!((en - 1.08).abs() < 1e-4, "energy = 1.0 + 0.10 grazed - 0.02 metabolism: {en}");
     }
 
@@ -1252,10 +1794,10 @@ mod tests {
         let parent = sim.test_spawn_herbivore(6, 6, vec![], 1.5);
         sim.tick();
         assert_eq!(sim.population(), 2, "should spawn one child");
-        let ep = sim.herb_energy(parent);
+        let ep = sim.creature_energy(parent);
         assert!((ep - 0.75).abs() < 1e-4, "parent keeps half its energy: {ep}");
         let child = sim.order[1];
-        let ec = sim.herb_energy(child);
+        let ec = sim.creature_energy(child);
         assert!((ec - 0.75).abs() < 1e-4, "child gets the other half: {ec}");
     }
 
@@ -1386,5 +1928,176 @@ mod tests {
             m.lineage_counts,
             "lineage-count record is not deterministic"
         );
+    }
+
+    // ----- rung 3: predator hunting / energy transfer / death / reproduction ---
+
+    /// Config for the predator mechanics tests: frozen plants, all baseline energy
+    /// drains (herb + predator metabolism / move) zeroed and reproduction out of
+    /// reach, so a single mechanic (catch, starvation, reproduction) is isolated
+    /// with exact arithmetic. Empty genomes ⇒ no movement, so placement holds.
+    fn pred_cfg(seed: u64) -> EcoConfig {
+        let mut c = cfg(seed, 16, 16);
+        freeze_plants(&mut c.params);
+        c.params.metabolism = 0.0;
+        c.params.move_cost = 0.0;
+        c.params.repro_threshold = 1000.0;
+        c.params.energy_max = 1000.0;
+        c.params.pred_metabolism = 0.0;
+        c.params.pred_move_cost = 0.0;
+        c.params.pred_repro_threshold = 1000.0;
+        c.params.pred_energy_max = 1000.0;
+        c.params.pred_speed = 1;
+        c
+    }
+
+    #[test]
+    fn predator_catch_kills_prey_and_transfers_energy_at_efficiency() {
+        // A predator adjacent to a herbivore catches it: the prey dies and the
+        // predator gains exactly `catch_efficiency` × the prey's energy. Empty
+        // brains ⇒ neither moves, so the geometry is fixed.
+        let mut c = pred_cfg(1);
+        c.params.catch_efficiency = 0.6;
+        let mut sim = EcoSim::new(c);
+        let prey = sim.test_spawn_herbivore(5, 5, vec![], 4.0);
+        let pred = sim.test_spawn_predator(5, 6, vec![], 10.0);
+        assert_eq!(sim.population(), 1);
+        assert_eq!(sim.predator_population(), 1);
+        sim.tick();
+        assert_eq!(sim.population(), 0, "caught prey should die");
+        assert!(!sim.is_live(prey), "caught prey must be despawned");
+        assert_eq!(sim.predator_population(), 1, "predator survives the catch");
+        let en = sim.creature_energy(pred);
+        // 10.0 + 0.6 * 4.0 = 12.4 (no metabolism/move in pred_cfg).
+        assert!((en - 12.4).abs() < 1e-4, "energy = 10 + 0.6*4 grazed: {en}");
+    }
+
+    #[test]
+    fn predator_starves_without_prey_and_deposits_a_corpse() {
+        // With no prey, `pred_metabolism` drives energy ≤ 0; the predator dies and
+        // its body deposits `pred_corpse_nutrient` into its cell (loop closes).
+        let mut c = pred_cfg(2);
+        c.params.pred_metabolism = 0.05;
+        c.params.pred_corpse_nutrient = 0.7;
+        let mut sim = EcoSim::new(c);
+        sim.set_cell(8, 8, 0.0, 0.0);
+        let pred = sim.test_spawn_predator(8, 8, vec![], 0.03);
+        sim.tick();
+        assert_eq!(sim.predator_population(), 0, "starved predator should die");
+        assert!(!sim.is_live(pred), "dead predator must be despawned");
+        let (n, _) = sim.cell_at(8, 8);
+        assert!((n - 0.7).abs() < 1e-4, "death should deposit pred_corpse_nutrient: {n}");
+    }
+
+    #[test]
+    fn predator_reproduction_splits_energy_and_needs_room() {
+        // Above threshold with a free neighbor ⇒ one predator child, energy split.
+        // Boxed in by obstacles ⇒ no child even above threshold.
+        let mut c = pred_cfg(3);
+        c.params.pred_repro_threshold = 1.0;
+        c.params.pred_mutation_rate = 0.0;
+        let mut sim = EcoSim::new(c);
+        let parent = sim.test_spawn_predator(6, 6, vec![], 2.0);
+        sim.tick();
+        assert_eq!(sim.predator_population(), 2, "should spawn one predator child");
+        let ep = sim.creature_energy(parent);
+        assert!((ep - 1.0).abs() < 1e-4, "parent keeps half its energy: {ep}");
+        let child = *sim.order.iter().find(|&&e| e != parent).unwrap();
+        assert!((sim.creature_energy(child) - 1.0).abs() < 1e-4, "child gets the other half");
+
+        // Boxed-in predator: no empty neighbor, so no reproduction.
+        let mut c2 = pred_cfg(4);
+        c2.params.pred_repro_threshold = 1.0;
+        let mut sim2 = EcoSim::new(c2);
+        for dy in -1i32..=1 {
+            for dx in -1i32..=1 {
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                sim2.grid.set_obstacle(((6 + dx) as u32, (6 + dy) as u32));
+            }
+        }
+        sim2.test_spawn_predator(6, 6, vec![], 2.0);
+        sim2.tick();
+        assert_eq!(sim2.predator_population(), 1, "a boxed-in predator cannot reproduce");
+    }
+
+    #[test]
+    fn order_is_stable_across_a_tick_with_both_species_birthing_and_dying() {
+        // In one tick, over a single `order` holding both species: herbivore A
+        // reproduces, herbivore B starves, predator P catches prey C (which dies)
+        // and reproduces. `order` must drop B and C (survivors keep their relative
+        // slots) and append the two newborns (A's herbivore, then P's predator).
+        let mut c = cfg(5, 16, 16);
+        freeze_plants(&mut c.params);
+        c.params.metabolism = 0.05; // starves B, survivable for A/C
+        c.params.move_cost = 0.0;
+        c.params.repro_threshold = 1.0;
+        c.params.energy_max = 100.0;
+        c.params.herb_mutation_rate = 0.0;
+        c.params.catch_efficiency = 0.6;
+        c.params.pred_metabolism = 0.0;
+        c.params.pred_move_cost = 0.0;
+        c.params.pred_repro_threshold = 1.0;
+        c.params.pred_energy_max = 100.0;
+        c.params.pred_mutation_rate = 0.0;
+        c.params.pred_speed = 1;
+        let mut sim = EcoSim::new(c);
+        let a = sim.test_spawn_herbivore(2, 2, vec![], 5.0); // reproduces
+        let b = sim.test_spawn_herbivore(9, 9, vec![], 0.03); // starves
+        let pred = sim.test_spawn_predator(5, 6, vec![], 5.0); // catches C, reproduces
+        let prey = sim.test_spawn_herbivore(5, 5, vec![], 1.0); // caught by pred
+        sim.tick();
+
+        assert!(!sim.is_live(b), "B should have starved");
+        assert!(!sim.is_live(prey), "C should have been caught");
+        assert_eq!(sim.population(), 2, "A + A's herbivore newborn");
+        assert_eq!(sim.predator_population(), 2, "P + P's predator newborn");
+        assert_eq!(sim.order[0], a, "A keeps its birth slot");
+        assert_eq!(sim.order[1], pred, "P shifts up past the culled B, order preserved");
+        // The two newborns are appended in (sub-phase, parent) order: A's herbivore
+        // first, then P's predator.
+        assert_eq!(sim.species_of(sim.order[2]), Some(Species::Herbivore), "A's newborn is a grazer");
+        assert_eq!(sim.species_of(sim.order[3]), Some(Species::Predator), "P's newborn is a predator");
+    }
+
+    #[test]
+    fn tri_trophic_run_is_deterministic() {
+        // The whole tri-trophic sim (parallel CA + serial two-species entity phase)
+        // is byte-identical across two same-seed runs: fields *and* both species'
+        // metrics (populations, births, deaths, mean energies).
+        let run = || {
+            let mut sim = EcoSim::new(cfg(2024, 64, 64));
+            sim.seed_initial();
+            for _ in 0..400 {
+                sim.tick();
+            }
+            let fields: Vec<(u32, u32)> = sim
+                .cells()
+                .iter()
+                .map(|c| (c.nutrient.to_bits(), c.biomass.to_bits()))
+                .collect();
+            let metrics: Vec<[u64; 8]> = sim
+                .metrics_history()
+                .iter()
+                .map(|m| {
+                    [
+                        m.population,
+                        m.predators,
+                        m.births,
+                        m.deaths,
+                        m.pred_births,
+                        m.pred_deaths,
+                        m.mean_energy.to_bits(),
+                        m.pred_mean_energy.to_bits(),
+                    ]
+                })
+                .collect();
+            (fields, metrics)
+        };
+        let a = run();
+        let b = run();
+        assert!(a.0 == b.0, "fields diverged under an identical seed");
+        assert!(a.1 == b.1, "tri-trophic metrics diverged under an identical seed");
     }
 }

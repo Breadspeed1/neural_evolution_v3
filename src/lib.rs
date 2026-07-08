@@ -11,12 +11,13 @@ use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{Agent, Connection, mutate_genome};
+use crate::agent::{Agent, BrainKind, Connection, mutate_genome};
 use crate::grid::Grid;
 
 pub mod agent;
 pub mod eco;
 pub mod grid;
+pub mod memtask;
 
 /// A creature's grid position, kept as its own hecs component: spatial queries
 /// (the decision phase, centroids, survival) touch it every step, far more often
@@ -45,6 +46,38 @@ pub enum Mode {
     #[default]
     Challenge,
     Eco,
+}
+
+/// Which brain dynamics to run (the `--brain` flag).
+///
+/// - `feedforward` (default): the original memoryless brain — byte-identical to
+///   before, so all baselines/determinism are preserved.
+/// - `ctrnn`: every creature gets a continuous-time recurrent brain with
+///   persistent state (functional memory) on the same sparse genome.
+/// - `mixed`: an **eco-only** competition seeding — half the founders of each
+///   species are feed-forward, half CTRNN, the type inherited by offspring, so
+///   the two brain types compete head-to-head for the same resources (the CTRNN
+///   A/B demonstration). In challenge mode `mixed` collapses to `feedforward`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub enum BrainMode {
+    #[default]
+    Feedforward,
+    Ctrnn,
+    Mixed,
+}
+
+impl BrainMode {
+    /// The single brain kind implied by this mode for a uniform (non-mixed) run.
+    /// `Mixed` collapses to `Feedforward` here — the eco founder scatter performs
+    /// the 50/50 split itself, so anywhere that needs one kind (the challenge sim,
+    /// a uniform eco run) reads mixed as feed-forward.
+    pub fn uniform_kind(self) -> BrainKind {
+        match self {
+            BrainMode::Ctrnn => BrainKind::Ctrnn,
+            _ => BrainKind::Feedforward,
+        }
+    }
 }
 
 /// Command-line configuration shared by both binaries (viewer + headless).
@@ -104,6 +137,17 @@ pub struct Cli {
     /// Headless only: run 50 generations and print gens/sec, then exit.
     #[arg(long)]
     pub bench: bool,
+    /// Brain dynamics: `feedforward` (default, memoryless), `ctrnn` (recurrent,
+    /// persistent state), or `mixed` (eco-only: a 50/50 feed-forward vs CTRNN
+    /// competition for the same resources — the A/B demonstration).
+    #[arg(long, value_enum, default_value_t = BrainMode::Feedforward)]
+    pub brain: BrainMode,
+    /// Headless only: run the delayed-recall memory benchmark (a task that
+    /// *provably* needs memory) for feed-forward vs CTRNN and print both learning
+    /// curves, then exit. The clean proof that recurrence pays off; see
+    /// `memtask.rs`.
+    #[arg(long)]
+    pub mem_bench: bool,
 }
 
 impl Cli {
@@ -117,6 +161,7 @@ impl Cli {
             seed,
             challenge: self.challenge,
             world_size: self.world_size,
+            brain: self.brain.uniform_kind(),
         }
     }
 }
@@ -170,6 +215,7 @@ pub fn build_eco_sim(cli: &Cli) -> eco::EcoSim {
         height: size,
         seed,
         params,
+        brain: cli.brain,
     });
     if let Some(path) = &cli.metrics {
         sim.set_metrics(path).expect("failed to open --metrics file");
@@ -185,6 +231,29 @@ pub fn build_eco_sim(cli: &Cli) -> eco::EcoSim {
 fn apply_eco_env_overrides(p: &mut eco::EcoParams) {
     let f32v = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f32>().ok());
     let usizev = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    // Plant-field knobs, for sweeping the meadow toward a sparse / depleting
+    // "advancing-front" regime where foraging can reward remembered heading.
+    if let Some(v) = f32v("ECO_SEED_RATE") {
+        p.seed_rate = v;
+    }
+    if let Some(v) = f32v("ECO_SEED_NUT_MIN") {
+        p.seed_nutrient_min = v;
+    }
+    if let Some(v) = f32v("ECO_MORTALITY") {
+        p.mortality = v;
+    }
+    if let Some(v) = f32v("ECO_UPTAKE") {
+        p.uptake = v;
+    }
+    if let Some(v) = f32v("ECO_CONVERSION") {
+        p.conversion = v;
+    }
+    if let Some(v) = f32v("ECO_DECAY") {
+        p.decay = v;
+    }
+    if let Some(v) = f32v("ECO_REPLENISH") {
+        p.replenish = v;
+    }
     if let Some(v) = f32v("ECO_GRAZE_CAP") {
         p.graze_cap = v;
     }
@@ -214,6 +283,12 @@ fn apply_eco_env_overrides(p: &mut eco::EcoParams) {
     }
     if std::env::var("ECO_RESEED").is_ok() {
         p.reseed_on_extinction = true;
+    }
+    // Turn off the herbivore directional food gradient (food goes out of view the
+    // instant a grazer steps off it), so foraging rewards *remembered* heading —
+    // the memory gradient the CTRNN A/B is measured under. See `herb_sense_gradient`.
+    if std::env::var("ECO_HERB_NOGRAD").is_ok() {
+        p.herb_sense_gradient = false;
     }
     // Predator (rung 3) tuning overrides — same dev-only, binary-path-only
     // discipline as the herbivore ones above, for sweeping the tri-trophic
@@ -519,6 +594,11 @@ pub struct SimConfig {
     /// (and the current default), which is what the challenge coordinates assume.
     #[serde(default = "default_world_size")]
     pub world_size: u32,
+    /// Brain dynamics for this run. Defaults to `Feedforward` when absent from an
+    /// older serialized champion (so those files still load), which is also the
+    /// original behavior.
+    #[serde(default)]
+    pub brain: BrainKind,
 }
 
 /// Default world side length (128), used for the `serde` default so champions
@@ -781,7 +861,7 @@ impl Simulator {
         let e = self.ecs.spawn((Position { x: 0, y: 0 },));
         let pos = self.rand_pos(e);
         let genome = make_genome(self);
-        let agent = Agent::new(&genome, self.config.amount_inners as u8, lineage);
+        let agent = Agent::new(&genome, self.config.amount_inners as u8, lineage, self.config.brain);
         self.ecs.insert_one(e, agent).expect("just-spawned entity exists");
         self.set_pos(e, pos);
         self.order.push(e);
@@ -879,6 +959,7 @@ impl Simulator {
         let seed = self.config.seed;
         let generation = self.generation;
         let amt_inners = self.config.amount_inners as u8;
+        let brain_kind = self.config.brain;
         let children: Vec<Agent> = (0..self.config.population)
             .into_par_iter()
             .map(|i| {
@@ -886,7 +967,7 @@ impl Simulator {
                 let mut rng =
                     ChaCha8Rng::seed_from_u64(agent_seed(seed, generation, REPRO_TAG, i as usize));
                 let genome = mutate_genome(pgenome, mutation_rate, &mut rng);
-                Agent::new(&genome, amt_inners, *lineage)
+                Agent::new(&genome, amt_inners, *lineage, brain_kind)
             })
             .collect();
 
@@ -1313,6 +1394,7 @@ mod tests {
             seed,
             challenge: Challenge::NorthBand,
             world_size: 128,
+            brain: BrainKind::Feedforward,
         }
     }
 
@@ -1652,7 +1734,7 @@ mod tests {
         // positions and the crowd centroid, not the grid, so occupancy is moot.
         for i in 0..22u32 {
             let p = if i == 21 { (120, 120) } else { (64, 64) };
-            let e = sim.ecs.spawn((Position { x: p.0, y: p.1 }, Agent::new(&genome, 8, 0)));
+            let e = sim.ecs.spawn((Position { x: p.0, y: p.1 }, Agent::new(&genome, 8, 0, BrainKind::Feedforward)));
             sim.order.push(e);
         }
         let survived = sim.eval_survival(0);

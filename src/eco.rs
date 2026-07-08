@@ -53,9 +53,9 @@ use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::Position;
-use crate::agent::{Brain, Connection, mutate_genome};
+use crate::agent::{Brain, BrainKind, Connection, mutate_genome};
 use crate::grid::{Cell, Grid};
+use crate::{BrainMode, Position};
 
 /// Herbivore sensor layout — the forager sensorium fed to the reused
 /// feed-forward [`Brain`] each tick. Width is [`HERB_INPUTS`]; the genome decodes
@@ -134,9 +134,15 @@ pub(crate) struct Creature {
     species: Species,
     /// The connection-list genome; a mutated copy is passed to each child.
     genome: Vec<u32>,
-    /// The decoded feed-forward brain (12 inputs → movement), rebuilt from the
-    /// genome at construction so brain and genome always agree.
+    /// The decoded brain (12 inputs → movement), rebuilt from the genome at
+    /// construction so brain and genome always agree. Feed-forward or CTRNN per
+    /// `kind`; a CTRNN brain carries persistent state across ticks over the
+    /// creature's whole life (the recurrent memory), reset only on birth.
     brain: Brain,
+    /// Which brain dynamics this creature runs — inherited verbatim by offspring,
+    /// so a lineage keeps its brain type. In a `Mixed` run the two types compete
+    /// for the same resources; this is the tag the A/B share metric counts.
+    kind: BrainKind,
     /// Body energy. Feeding adds, metabolism/movement subtract; ≤0 ⇒ death,
     /// ≥ the species' repro threshold ⇒ a mutated child (energy split in half).
     energy: f32,
@@ -161,6 +167,9 @@ pub struct CreatureView {
     /// Energy as a 0..1 fraction of the species' `energy_max` (drives brightness).
     pub energy_frac: f32,
     pub species: Species,
+    /// Feed-forward or CTRNN — so the viewer can mark the two brain types on the
+    /// field and label the selected creature's brain panel.
+    pub kind: BrainKind,
 }
 
 /// The tunable dynamics of the meadow. Kept as a struct (rather than bare
@@ -245,6 +254,17 @@ pub struct EcoParams {
     /// If true, scatter a fresh founder cohort whenever the herbivores go extinct
     /// (a tuning-robustness aid; the coexistence gate is measured with it OFF).
     pub reseed_on_extinction: bool,
+    /// Whether herbivores sense the local biomass **gradient** (the `grad_ns` /
+    /// `grad_ew` inputs pointing toward adjacent food). Default `true` — the
+    /// original forager sensorium, byte-identical to the pre-CTRNN baseline. Set
+    /// `false` to make food **out of view** the instant a herbivore steps off it:
+    /// it then knows only `food_here` (is it *standing* on food), so foraging
+    /// efficiently across the patchy meadow requires **remembering a heading**
+    /// over barren gaps. That is the memory gradient under which a CTRNN's
+    /// recurrence pays off against a memoryless feed-forward brain — the signal
+    /// the mixed A/B (see DESIGN.md) is measured on. Applied identically to both
+    /// brain types, so the competition stays fair.
+    pub herb_sense_gradient: bool,
 
     // --- predators (rung 3: the apex tier, a second evolving species) ---
     /// Fraction of a caught herbivore's energy the predator assimilates (trophic
@@ -340,6 +360,7 @@ impl Default for EcoParams {
             herb_mutation_rate: 0.02,
             init_herbivores: 150,
             reseed_on_extinction: false,
+            herb_sense_gradient: true,
             // Predator economy (rung 3), tuned (seeds 42/7/123, 128², 25k–50k
             // ticks) for persistent, self-sustaining tri-trophic coexistence. Two
             // levers do the work: (1) a **moderate** sensing radius (4 — still
@@ -383,6 +404,10 @@ pub struct EcoConfig {
     pub height: usize,
     pub seed: u64,
     pub params: EcoParams,
+    /// Brain dynamics for this run: uniform feed-forward / CTRNN, or `Mixed` (a
+    /// 50/50 head-to-head competition seeding — see [`crate::BrainMode`]). Under
+    /// `Feedforward` the whole sim is byte-identical to the pre-CTRNN baseline.
+    pub brain: BrainMode,
 }
 
 /// One metrics record (per recorded tick). No wall-clock field, so two same-seed
@@ -419,6 +444,24 @@ pub struct EcoMetrics {
     /// `population - Σ count`. Drives the bloodlines strip; `Σ count + other`
     /// always equals `population`.
     pub lineage_counts: Vec<(u32, u32)>,
+    /// CTRNN-brained herbivores among `population` (the rest are feed-forward). The
+    /// A/B readout: `ctrnn_population / population` is the CTRNN share of the prey.
+    /// Zero — and **omitted from the JSON** — in any non-mixed feed-forward run, so
+    /// a `--brain feedforward` metrics file is byte-identical to the pre-CTRNN
+    /// baseline (the determinism gate).
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub ctrnn_population: u64,
+    /// CTRNN-brained predators among `predators` (the rest feed-forward). Same
+    /// skip-when-zero rule as `ctrnn_population`.
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub ctrnn_predators: u64,
+}
+
+/// Skip a `u64` metrics field when it is zero — used so the CTRNN-share fields
+/// vanish from a pure feed-forward run's JSONL, keeping it byte-identical to the
+/// pre-CTRNN baseline.
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Derive a deterministic per-cell seed for the stochastic seeding draw, in the
@@ -650,6 +693,7 @@ impl EcoSim {
             }
             let genome: Vec<u32> =
                 (0..p.herb_genome_length).map(|_| rng.random::<u32>()).collect();
+            let kind = self.founder_kind(placed);
             let e = self.spawn_creature(
                 pos,
                 genome,
@@ -657,6 +701,7 @@ impl EcoSim {
                 placed as u32,
                 p.herb_inner_neurons,
                 Species::Herbivore,
+                kind,
             );
             self.order.push(e);
             placed += 1;
@@ -687,6 +732,7 @@ impl EcoSim {
             }
             let genome: Vec<u32> =
                 (0..p.pred_genome_length).map(|_| rng.random::<u32>()).collect();
+            let kind = self.founder_kind(placed);
             let e = self.spawn_creature(
                 pos,
                 genome,
@@ -694,6 +740,7 @@ impl EcoSim {
                 PRED_LINEAGE_BASE + placed as u32,
                 p.pred_inner_neurons,
                 Species::Predator,
+                kind,
             );
             self.order.push(e);
             placed += 1;
@@ -705,6 +752,7 @@ impl EcoSim {
     /// entity. Does **not** append to `order` — callers control ordering (founders
     /// push directly; births are appended after the entity phase so they act next
     /// tick).
+    #[allow(clippy::too_many_arguments)]
     fn spawn_creature(
         &mut self,
         pos: (u32, u32),
@@ -713,18 +761,31 @@ impl EcoSim {
         lineage: u32,
         amt_inners: u8,
         species: Species,
+        kind: BrainKind,
     ) -> Entity {
         let num_inputs = match species {
             Species::Herbivore => HERB_INPUTS,
             Species::Predator => PRED_INPUTS,
         };
-        let brain = Brain::from(genome.clone(), num_inputs, amt_inners);
+        let brain = Brain::from(genome.clone(), num_inputs, amt_inners, kind);
         let e = self.ecs.spawn((
             Position { x: pos.0, y: pos.1 },
-            Creature { species, genome, brain, energy, lineage, amt_inners },
+            Creature { species, genome, brain, energy, lineage, amt_inners, kind },
         ));
         self.grid.set_occupant(pos, e);
         e
+    }
+
+    /// The brain kind a founder at scatter index `index` gets. Uniform runs give
+    /// every founder the same kind; a `Mixed` run alternates feed-forward / CTRNN
+    /// by index, so each species' founder cohort is a deterministic 50/50 split —
+    /// the head-to-head competition seeding for the A/B demonstration.
+    fn founder_kind(&self, index: usize) -> BrainKind {
+        if self.config.brain == BrainMode::Mixed {
+            if index.is_multiple_of(2) { BrainKind::Feedforward } else { BrainKind::Ctrnn }
+        } else {
+            self.config.brain.uniform_kind()
+        }
     }
 
     /// Read a creature's grid position (copied out, so no ECS borrow escapes).
@@ -772,8 +833,17 @@ impl EcoSim {
             }
         };
         let (x, y) = (pos.0 as i32, pos.1 as i32);
-        let grad_ns = ((biomass_at(x, y + 1) - biomass_at(x, y - 1)) / bm).clamp(-1.0, 1.0);
-        let grad_ew = ((biomass_at(x + 1, y) - biomass_at(x - 1, y)) / bm).clamp(-1.0, 1.0);
+        // The directional food gradient — the "view" of adjacent food. Zeroed when
+        // `herb_sense_gradient` is off, so food is out of view unless the herbivore
+        // is standing on it (the memory gradient; see `herb_sense_gradient`).
+        let (grad_ns, grad_ew) = if self.config.params.herb_sense_gradient {
+            (
+                ((biomass_at(x, y + 1) - biomass_at(x, y - 1)) / bm).clamp(-1.0, 1.0),
+                ((biomass_at(x + 1, y) - biomass_at(x - 1, y)) / bm).clamp(-1.0, 1.0),
+            )
+        } else {
+            (0.0, 0.0)
+        };
         let mut occ = 0.0f32;
         for dy in -1..=1 {
             for dx in -1..=1 {
@@ -1029,9 +1099,9 @@ impl EcoSim {
             {
                 let child_energy = energy * 0.5;
                 energy -= child_energy;
-                let (pgenome, lineage, amt) = {
+                let (pgenome, lineage, amt, kind) = {
                     let hb = self.ecs.get::<&Creature>(e).expect("parent exists");
-                    (hb.genome.clone(), hb.lineage, hb.amt_inners)
+                    (hb.genome.clone(), hb.lineage, hb.amt_inners, hb.kind)
                 };
                 let child_genome = mutate_genome(&pgenome, p.herb_mutation_rate, &mut rng);
                 let child = self.spawn_creature(
@@ -1041,6 +1111,7 @@ impl EcoSim {
                     lineage,
                     amt,
                     Species::Herbivore,
+                    kind,
                 );
                 births.push(child);
                 herb_births += 1;
@@ -1173,9 +1244,9 @@ impl EcoSim {
             {
                 let child_energy = energy * 0.5;
                 energy -= child_energy;
-                let (pgenome, lineage, amt) = {
+                let (pgenome, lineage, amt, kind) = {
                     let pd = self.ecs.get::<&Creature>(e).expect("parent exists");
-                    (pd.genome.clone(), pd.lineage, pd.amt_inners)
+                    (pd.genome.clone(), pd.lineage, pd.amt_inners, pd.kind)
                 };
                 let child_genome = mutate_genome(&pgenome, p.pred_mutation_rate, &mut rng);
                 let child = self.spawn_creature(
@@ -1185,6 +1256,7 @@ impl EcoSim {
                     lineage,
                     amt,
                     Species::Predator,
+                    kind,
                 );
                 births.push(child);
                 pred_births += 1;
@@ -1356,18 +1428,29 @@ impl EcoSim {
         let mut total_energy = 0.0f64;
         let mut predators = 0u64;
         let mut pred_total_energy = 0.0f64;
+        // CTRNN-brained counts per species — the A/B share readout. Stay 0 in a
+        // pure feed-forward run (so the JSON stays byte-identical to baseline).
+        let mut ctrnn_population = 0u64;
+        let mut ctrnn_predators = 0u64;
         let mut tally: BTreeMap<u32, u32> = BTreeMap::new();
         for &e in &self.order {
             let c = self.ecs.get::<&Creature>(e).expect("live creature");
+            let is_ctrnn = c.kind == BrainKind::Ctrnn;
             match c.species {
                 Species::Herbivore => {
                     population += 1;
                     total_energy += c.energy as f64;
+                    if is_ctrnn {
+                        ctrnn_population += 1;
+                    }
                     *tally.entry(c.lineage).or_insert(0) += 1;
                 }
                 Species::Predator => {
                     predators += 1;
                     pred_total_energy += c.energy as f64;
+                    if is_ctrnn {
+                        ctrnn_predators += 1;
+                    }
                 }
             }
         }
@@ -1397,6 +1480,8 @@ impl EcoSim {
             pred_deaths: self.pred_deaths_accum,
             pred_mean_energy,
             lineage_counts,
+            ctrnn_population,
+            ctrnn_predators,
         };
         // Births/deaths are reported per recording interval, so reset the running
         // counters once folded into a record.
@@ -1471,6 +1556,7 @@ impl EcoSim {
                     lineage: c.lineage,
                     energy_frac: (c.energy / emax).clamp(0.0, 1.0),
                     species: c.species,
+                    kind: c.kind,
                 }
             })
             .collect()
@@ -1496,6 +1582,12 @@ impl EcoSim {
     /// and pick the right sensor-row labels). `None` if it despawned.
     pub fn species_of(&self, e: Entity) -> Option<Species> {
         self.ecs.get::<&Creature>(e).ok().map(|c| c.species)
+    }
+
+    /// The brain kind of one live creature (so the viewer can label the selected
+    /// creature's brain panel feed-forward vs CTRNN). `None` if it despawned.
+    pub fn brain_kind_of(&self, e: Entity) -> Option<BrainKind> {
+        self.ecs.get::<&Creature>(e).ok().map(|c| c.kind)
     }
 
     /// Every recorded tick's metrics (drives the viewer's biomass/coverage
@@ -1542,7 +1634,8 @@ impl EcoSim {
         lineage: u32,
     ) -> Entity {
         let amt = self.config.params.herb_inner_neurons;
-        let e = self.spawn_creature((x, y), genome, energy, lineage, amt, Species::Herbivore);
+        let kind = self.config.brain.uniform_kind();
+        let e = self.spawn_creature((x, y), genome, energy, lineage, amt, Species::Herbivore, kind);
         self.order.push(e);
         e
     }
@@ -1552,7 +1645,8 @@ impl EcoSim {
     #[cfg(test)]
     fn test_spawn_predator(&mut self, x: u32, y: u32, genome: Vec<u32>, energy: f32) -> Entity {
         let amt = self.config.params.pred_inner_neurons;
-        let e = self.spawn_creature((x, y), genome, energy, PRED_LINEAGE_BASE, amt, Species::Predator);
+        let kind = self.config.brain.uniform_kind();
+        let e = self.spawn_creature((x, y), genome, energy, PRED_LINEAGE_BASE, amt, Species::Predator, kind);
         self.order.push(e);
         e
     }
@@ -1568,7 +1662,11 @@ mod tests {
     use super::*;
 
     fn cfg(seed: u64, w: usize, h: usize) -> EcoConfig {
-        EcoConfig { width: w, height: h, seed, params: EcoParams::default() }
+        cfg_brain(seed, w, h, BrainMode::Feedforward)
+    }
+
+    fn cfg_brain(seed: u64, w: usize, h: usize, brain: BrainMode) -> EcoConfig {
+        EcoConfig { width: w, height: h, seed, params: EcoParams::default(), brain }
     }
 
     /// Freeze the plant/nutrient CA (zero every reaction + diffusion term) so a
@@ -2099,5 +2197,69 @@ mod tests {
         let b = run();
         assert!(a.0 == b.0, "fields diverged under an identical seed");
         assert!(a.1 == b.1, "tri-trophic metrics diverged under an identical seed");
+    }
+
+    // ----- CTRNN brains: determinism + the mixed-competition seeding -----
+
+    /// Fields + both species' metrics for a run, for the determinism assertions.
+    fn run_signature(sim: &EcoSim) -> (Vec<(u32, u32)>, Vec<[u64; 4]>) {
+        let fields: Vec<(u32, u32)> = sim
+            .cells()
+            .iter()
+            .map(|c| (c.nutrient.to_bits(), c.biomass.to_bits()))
+            .collect();
+        let metrics: Vec<[u64; 4]> = sim
+            .metrics_history()
+            .iter()
+            .map(|m| [m.population, m.predators, m.ctrnn_population, m.ctrnn_predators])
+            .collect();
+        (fields, metrics)
+    }
+
+    #[test]
+    fn ctrnn_run_is_deterministic() {
+        // A full CTRNN tri-trophic run (persistent recurrent state carried per
+        // creature across ticks) is byte-identical across two same-seed runs.
+        let run = || {
+            let mut sim = EcoSim::new(cfg_brain(2024, 64, 64, BrainMode::Ctrnn));
+            sim.seed_initial();
+            for _ in 0..300 {
+                sim.tick();
+            }
+            run_signature(&sim)
+        };
+        let a = run();
+        let b = run();
+        assert!(a.0 == b.0, "CTRNN fields diverged under an identical seed");
+        assert!(a.1 == b.1, "CTRNN metrics diverged under an identical seed");
+    }
+
+    #[test]
+    fn mixed_run_splits_founders_and_is_deterministic() {
+        // A `Mixed` run seeds each species' founders 50/50 feed-forward vs CTRNN
+        // (the head-to-head competition), and the whole run is deterministic.
+        let build = || {
+            let mut sim = EcoSim::new(cfg_brain(2024, 64, 64, BrainMode::Mixed));
+            sim.seed_initial();
+            sim
+        };
+        let sim = build();
+        let m0 = sim.latest().unwrap();
+        // Defaults: 150 herbivore founders, 26 predators — half of each are CTRNN.
+        assert_eq!(m0.ctrnn_population, 75, "half the herbivore founders are CTRNN");
+        assert_eq!(m0.ctrnn_predators, 13, "half the predator founders are CTRNN");
+        assert!(m0.ctrnn_population < m0.population, "the other half are feed-forward");
+
+        let run = || {
+            let mut sim = build();
+            for _ in 0..300 {
+                sim.tick();
+            }
+            run_signature(&sim)
+        };
+        let a = run();
+        let b = run();
+        assert!(a.0 == b.0, "mixed fields diverged under an identical seed");
+        assert!(a.1 == b.1, "mixed metrics diverged under an identical seed");
     }
 }

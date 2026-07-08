@@ -121,7 +121,7 @@ Every step in this roadmap obeys the inversion of that mistake:
   `creature_seed(seed, tick, index)` stream), and the serial entity phase iterates
   it **twice** — grazers first (rung-2 logic verbatim, so a herbivore-only run is
   byte-identical), then hunters — branching on species. Predators reuse the
-  feed-forward [`Brain`] over a **13→12-input hunting sensorium** (`PRED_INPUTS`:
+  feed-forward [`Brain`] over a **12-input hunting sensorium** (`PRED_INPUTS`:
   bias/oscillator/own-energy/random, a wide-radius **prey-density** scalar + a
   distance-weighted **prey-direction** NS/EW gradient, four directional
   blocked-neighbour sensors, and own-species **pack** spacing). Each tick a

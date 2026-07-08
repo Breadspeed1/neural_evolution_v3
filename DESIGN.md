@@ -128,9 +128,12 @@ Every step in this roadmap obeys the inversion of that mistake:
   sensors (`x/127`, `y/127`) that let an agent navigate to absolute coordinates,
   which is what unlocks the pattern challenges.
 - **Dashboard**: dark-themed live viewer — world with challenge-aware terrain
-  tinting, survival/diversity sparklines, lineage coloring, a live brain-inspector
-  node-link diagram, motion trails, oriented agents, generation-turnover pulse,
-  occupancy heatmap.
+  tinting, survival/diversity sparklines, lineage coloring, a live **signal-flow**
+  brain-inspector node-link diagram (edge brightness = live signal, outputs flash
+  on firing), motion trails, oriented agents, generation-turnover pulse, occupancy
+  heatmap. The eco terrarium adds a **spotlight** protagonist mode (`f`), a
+  **bloodlines** stacked-area strip of dynasty share over time, entity-tracked
+  click/`b` selection, and an energy-scaled calmer crowd (see roadmap 1).
 
 ## What the current substrate can already produce (just not selected for / shown)
 
@@ -142,8 +145,9 @@ These need no new mechanics — only selection pressure and the right readout:
 - **Rhythmic gaits.** The oscillator input can evolve into periodic movement.
   Invisible while we only record final position; a path-shape readout surfaces it.
 - **Selective sweeps.** Neutral diversity collapsing into a few winning lineages,
-  with rare comebacks — real population genetics, made visible by a bloodlines
-  strip chart (stacked lineage share over generations).
+  with rare comebacks — real population genetics. Now made visible in the eco
+  terrarium by the **bloodlines strip** (stacked lineage share over time); seed 42
+  resolves from a diverse rainbow into one dynasty holding ~64% by tick ~9000.
 
 ## Roadmap (dependency-ordered; each step is a measurable gate)
 
@@ -153,19 +157,44 @@ terrarium is built on. Steps 4 (energy/food) and 5 (pheromone field) are the one
 that cash in its per-cell state and per-entity components; it was landed first, as
 a behavior-preserving swap, so those can be built cleanly.*
 
-### 1. Viewer storytelling *(in progress)*
-The sim view shows 1000 equally-weighted dots — spectacle without story; the brain
-panel shows static wiring, not activity. Fixes:
-- **Spotlight mode**: dim the crowd, elevate one protagonist; its brain panel
-  becomes its live mind, so behavior (left) correlates with circuit (right).
-- **Signal-flow brain**: edge brightness = live signal (source activation ×
-  weight), output nodes flash on firing, cap to the ~30 strongest edges.
-- **Bloodlines strip**: lineage population share over generations (needs a tiny
-  data-only lib hook: per-generation lineage counts).
-- **Calmer baseline**: smaller/dimmer crowd; full trails become part of spotlight.
+### 1. Viewer storytelling *(done)*
+The sim view showed thousands of equally-weighted dots — spectacle without story
+("like watching sprinkles"); the brain panel showed static wiring, not activity.
+Shipped, in the eco terrarium and (where it unified cleanly) the challenge sim:
+- **Spotlight mode** (`f`): dims the whole crowd to a faint wash and elevates the
+  one selected protagonist — full-bright body, a white selection ring, a fading
+  comet-tail trail. The primary confetti fix: one protagonist against a quiet
+  field. Off by default (the calm baseline is the resting view).
+- **Signal-flow brain**: the shared node-link inspector now carries *live* signal
+  — edge brightness/alpha = |source activation × weight| (quiet wiring goes dark,
+  active pathways light up), output nodes flash a warm halo on the tick they fire
+  (cross the movement threshold), capped to the ~30 strongest edges for the eco
+  herbivore (input rows labelled from the 12-input forager sensorium). The
+  challenge inspector inherits the same live edges + output flash.
+- **Eco selection**: click picks the nearest grazer, `b` the heuristic best —
+  the *highest-energy member of the current largest lineage* (the reigning
+  dynasty's fittest grazer), so the ringed protagonist's hue matches the widest
+  bloodlines band. Selection follows the creature by stable entity id across
+  ticks and auto-reselects (via `b`) on its death.
+- **Bloodlines strip**: a stacked-area chart of lineage population share over
+  time, driven by the per-interval dynasty record (top-N lineages by population,
+  the rest folded to "other"). Bands are hued by the same `lineage_hue` mapping
+  the grazers use, so a band matches its creatures on the field — watch dynasties
+  bloom, dominate, and crash (a real selective sweep: seed 42 resolves from a
+  diverse rainbow into one dynasty holding **~64%** by tick ~9000).
+- **Calmer baseline** (spotlight off): the crowd drawn smaller/dimmer and
+  desaturated, with radius *and* brightness ∝ energy (fat vs starving at a
+  glance), so density reads as a breathing meadow; per-agent trails are now
+  spotlight-only (the one protagonist), not everyone-always.
 
-*Gate: one creature's decisions are legible from its brain panel; a lineage sweep
-is visible in the strip.*
+The lib stayed render-agnostic — the only new data surface was the committed
+read-only hooks (herbivore brain/lineage/energy accessors + the dynasty record);
+all rendering lives in `main.rs`. Determinism unchanged (same-seed eco runs stay
+byte-identical). Keys: `q`/`e` speed, `v` display, `f` spotlight, `b` best,
+click select (challenge keeps `c` colors, `h` heat).
+
+*Gate met: one grazer's decisions are legible from its live brain panel (outputs
+flash as it moves), and a lineage sweep is visible in the bloodlines strip.*
 
 ### 2. Creative visual goals — position sensor + pattern challenges *(current)*
 The near-term payoff: selection targets that make the swarm *draw* something.
